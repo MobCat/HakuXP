@@ -66,11 +66,13 @@ Keep both saved patch files when publishing/recreating the fork.
 | `build.bat core` | Build `libhakuxcore.so`, `libhakuxdebug.so`, `xboxrun` and `xbdm_smoke` for Android |
 | `build.bat libs` | Strip and copy all eight libraries from the last core build |
 | `build.bat apk` | Stage last native build and assemble debug APK |
-| `build.bat release` | Build the core, then the signed release APK, copied as `build/release/HakuXP-<version>.apk` with its signer and SHA-256; stops without `android/key.properties` (see "Release builds") |
+| `build.bat release` | Build the core, then the signed release APK, copied as `build/apk/HakuXP-<version>.<commit>-release.apk` with its signer and SHA-256; stops without `android/key.properties` (see "Release builds") |
 | `build.bat release-apk` | The same from the last native build (no core build) |
+| `build.bat release-check` | Build the core and inspect an unsigned release APK without a signing key |
 | `build.bat keystore` | Make HakuXP's release key and `android/key.properties`, once; asks for the password |
-| `build.bat install` | Install the existing debug APK using ADB, on `ANDROID_SERIAL` or the device `wireless.bat use` remembers; does not build it |
-| `install.bat` | Install the last debug build on the test device (Wi-Fi or USB), saying which device and how long it took; `install.bat build` builds first. Same as `build.bat install` |
+| `build.bat install` | Install the newest signed release APK (`build/apk/HakuXP-*-release.apk`) using ADB, on `ANDROID_SERIAL` or the device `wireless.bat use` remembers; does not build it |
+| `build.bat install-debug` | Install the newest debug APK (`build/apk/HakuXP-*-debug.apk`) using ADB; does not build it |
+| `install.bat` | Install the last signed release build on the test device (Wi-Fi or USB), saying which device and how long it took; `install.bat build` builds release first, `install.bat debug [build]` targets the debug APK |
 | `wireless.bat` | Wireless ADB: `pair`, `connect`, `use`, `status`, `tcpip`; see "Wireless debugging" below |
 | `build.bat reconfigure` | Remove CMakeCache.txt and configure again |
 | `build.bat clean` | Remove native output under project `build/`, then Gradle clean |
@@ -106,8 +108,8 @@ them. Do not use `apk` after cleaning until the native build is restored.
 
 ## Outputs and installation
 
-- Debug APK: `android/app/build/outputs/apk/debug/app-debug.apk`.
-- Release APK: `android/app/build/outputs/apk/release/`.
+- Debug APK: `build/apk/HakuXP-<version>.<commit>-debug.apk` (raw Gradle output: `android/app/build/outputs/apk/debug/app-debug.apk`).
+- Release APK: `build/apk/HakuXP-<version>.<commit>-release.apk` (raw Gradle output: `android/app/build/outputs/apk/release/`).
 - Native core and symbols: `build/native/core/libhakuxcore.so`.
 - Device CLI: `build/native/core/xboxrun`.
 - Device debug smoke test: `build/native/core/xbdm_smoke`.
@@ -157,6 +159,14 @@ To bring things across:
 
 ## Release builds
 
+Run `build.bat release-check` to build and inspect the release before
+setting up signing. It stages the native libraries, runs Gradle's
+`assembleRelease` (including R8 and release vital lint), and reads the
+finished APK. It checks the application ID, version against Gradle's output
+metadata, debuggable flag, ARM64 ABI, required libraries, absence of debug
+Vulkan layers, ZIP alignment and bundled notices. The output is
+`android/app/build/outputs/apk/release/app-release-unsigned.apk`.
+
 A release APK is signed with HakuXP's own key, or `build.bat release` stops:
 an unsigned APK can't be installed, and Android installs an update only over
 an app signed with the same key. Make the key once:
@@ -180,11 +190,18 @@ store and writes only `key.properties`. `HX_KEY_PROPERTIES` (in
 Then `build.bat release` builds the core and the APK, checks the signature
 with `apksigner`, and copies it to `build\release\HakuXP-<version>.apk`,
 printing the signer's certificate digests and the APK's SHA-256 for the
-release notes. `build.bat release-apk` skips the core build.
+release notes. Both signed build commands run the same package checks.
+`build.bat release-apk` skips the core build.
 
-- Version: `versionName` and `versionCode` in `android/app/build.gradle.kts`
-  (HakuXP's own numbering, from 0.1.0 / 1). Raise `versionCode` for every
-  release.
+When publishing, include the source revision used to build the APK,
+including the pinned dependencies and the patches applied by `setup.bat`.
+The APK carries the repository's `LICENSE`, `COPYING` and third-party
+notices under `assets/notices/`.
+
+- Version: `hakuxp.versionName` and `hakuxp.versionCode` in
+  `android/gradle.properties` (HakuXP's own numbering, from 0.1.0 / 1;
+  overridable with `-Phakuxp.versionName=...` / `-Phakuxp.versionCode=...`).
+  Raise `hakuxp.versionCode` for every release.
 - Update checks: the build names HakuXP's GitHub releases,
   `hakuxp.updateRepo=MobCat/HakuXP` in `android/gradle.properties` (another
   with `-Phakuxp.updateRepo=owner/name`). The app checks that repository's
@@ -200,6 +217,27 @@ release notes. `build.bat release-apk` skips the core build.
 - Debugging: release builds start with Settings > HakuXP > Debug >
   Debugging off (no XBDM service, overlays, guide Debug tab or playbooks);
   debug builds start with it on. See docs/DEBUGGING.md.
+
+### Release checks on 2026-11-19
+
+- `build.bat release-check` built `zip.mobcat.hakuxp` 0.1.0 (1). Release
+  vital lint passed. The unsigned APK was 7,697,188 bytes, SHA-256
+  `c243e820b3306a60f9840247c4d82ecd68ad5712f511ddae9440c206ffe6dab0`.
+  Its 22 notice files and 18 mod files matched the source files byte for byte.
+- `build.bat release-apk` ran in a temporary copy of the app project with
+  the same native build and a disposable key. Android's `apksigner` verified
+  the result. The versioned copy matched the verified APK. The temporary
+  project and key were removed. The normal checkout stopped at the missing
+  owner signing configuration when running `build.bat release`.
+- All 29 native host tests, three XBDM host tests and 176 Android debug JVM
+  tests passed.
+- After release signing was configured, the 20:11 build stopped at
+  `:app:processReleaseResources` because the AAPT2 daemon failed to start.
+  At 20:14, rerunning `build.bat release` ran the resource task successfully
+  and produced `build/release/HakuXP-0.1.0.apk` (7,705,380 bytes, SHA-256
+  `8daa44be28a62245d0b8d97a19339ad93c72e685ecb55ba4c5df3f917795ba4f`).
+  `apksigner verify --verbose --print-certs` verified the final copy's v2
+  signature with signer `CN=HakuXP`. On-device testing of this APK is pending.
 
 ## Wireless debugging
 
@@ -1414,3 +1452,63 @@ Not checked: the other steps on the device, controller focus,
 the folder picker's return, the mapping screen's return and a ZIP added
 from the step are unseen. A real disk image brought in with its EEPROM,
 end to end. Portrait, larger fonts, TalkBack.
+
+### Setup footer and Finish, 2026-11-19
+
+The Odin2 crash log recorded two release crashes in the setup wizard.
+Retracing with the matching R8 mapping placed both at the lookup of step
+index 4 in a four-step list. A Compose regression test reproduced the
+earlier symptom after a single Next press: the Controls page opened while
+the bottom bar still showed Games as current.
+
+The page and footer now change together. Back and Next target a specific
+page, and Finish records completion once. `SetupNavigationTest` covers
+the active indicator, Back, a direct jump, two Next activations before
+the next frame, and repeated Finish. All 177 Android JVM tests passed.
+A separate Robolectric run opened the actual app navigation graph with
+update checks disabled, advanced through all four setup screens, and
+verified that Finish opened the library and saved completion.
+
+The signed release was installed in place on the Odin2 at 20:37. Its
+installed APK matched the build's SHA-256
+`a5592178ff65e6a66e311f29a3a2d610fff0dbd55fc2eb8e8859dc6b2aacdb25`.
+The setup interaction was verified on the host. Device verification
+covered the installation and APK hash.
+
+## Overlay target pace (`none` vs `n/a`) and Republic Commando intro, 2026-11-22
+
+*Star Wars: Republic Commando* (`4C410013` / `LA01907A`) exposed two intro bugs
+and a `Target:` reporting bug:
+
+- **PersistDisplay raw-RAM glitch**: `nc_dev_nv2a_display_mode` (`native/dev/nv2a.c`)
+  now updates `NV_PCRTC_START`, and `hle_pbd_cpu_display` (`hw/xbox/hle/pb/pbdraw.c`)
+  hands off `shown_id` via `display_mode_fb` when `AvSetDisplayMode` switches to
+  a persisted GPU surface (`D3DDevice::PersistDisplay`), stopping `hle_pbd_scanout`
+  from scanning freed heap RAM.
+- **IMMEDIATE intro slowdown**: `pbdraw.c` (`swap_pace`) now bounds the decoder
+  to 3 in-flight swaps (`HLE_FRAMES`), preventing clear-only `IMMEDIATE` loops
+  from queueing tens of thousands of swaps ahead of Vulkan and exhausting the
+  32 MiB upload arena on PVIDEO overlays.
+- **Overlay `Target:` wording (`none` vs `n/a`) and scoring target**:
+  `hw/xbox/hle/hitch.c` (`hle_hitch_pace`) now clamps cadence tracking to valid
+  Xbox D3D8 vblank divisors (`1..4`) and distinguishes:
+  - `Target: none (60 Hz)` (`HLE_PACE_NONE`, log `pace: none (60 Hz)`): the
+    developer explicitly set no framerate cap/target (`D3DPRESENT_INTERVAL_IMMEDIATE`),
+    kept distinct from the emulator's own "Uncapped frame rate" setting.
+  - `Target: n/a (60 Hz)` (`HLE_PACE_NA`, log `pace: n/a (60 Hz)`): no valid
+    target/cap is available or measurable due to an issue/missing pacing (8+
+    stalled frames slower than 4 vblanks with no vsync cadence) or the
+    emulator's own "Uncapped frame rate" override (`HAKUX_HLE_UNCAP`).
+  - Both catalog extractors (`tools/catalog/extract.py`,
+    `debugger/internal/catalog/extract.go`) parse `pace:` lines and cap original
+    Xbox inferred targets at console refresh (`60.0` NTSC / `50.0` PAL) rather
+    than `120.0`. See `docs/CATALOG.md` ("Target FPS, `none` vs `n/a`").
+
+Host tests passed: `test.bat` 29/29, `tests/native/wireless/test_catalog.py` 11/11,
+`go test ./internal/catalog/...`, and Android JVM `FpsOverlayTextTest`. Signed
+release APK `build/apk/HakuXP-0.4.0.2c61c165-release.apk` (SHA-256
+`78ba33800b3d84ec824a6c35b8467d68b2c3075dbea4b81dbe2cbe885769dbf3`) installed on
+the Odin2; Republic Commando played its intro cleanly at ~30 overlay fps to the
+Press Start screen with `Target: none (60 Hz)` on screen and `pace: none (60 Hz)`
+in logcat (`build/screenshots/rc_target_none.png`). Not tested on device:
+`Target: n/a (60 Hz)` under `HAKUX_HLE_UNCAP` or a stalled title, PAL 50 Hz.

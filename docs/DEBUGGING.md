@@ -18,9 +18,10 @@ set "HX_XBDLOG=F:\Projects\C++\DinoRec\xbdtools\xbdlog.exe"
 ```
 
 Build the APK with `build.bat`, then install it on the selected Android
-device. USB debugging must be enabled and the PC authorized. The APK still
-has the upstream debug identity; see [BUILDING.md](BUILDING.md) before
-replacing an existing installation.
+device. USB debugging must be enabled and the PC authorized. HakuXP installs
+under its own application ID (`zip.mobcat.hakuxp.debug` for debug builds,
+`zip.mobcat.hakuxp` for release), next to hakuX; see [BUILDING.md](BUILDING.md)
+for package migration details.
 
 From Command Prompt in the project root:
 
