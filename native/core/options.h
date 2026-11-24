@@ -6,6 +6,8 @@
  *                    vblank (the HLE GPU's HAKUX_HLE_UNCAP)
  *   relaunch         a title's reboot into another of its XBEs
  *   loadstate=FILE   boot into a savestate (native/state)
+ *   ec=HEX           the emulation count starts here, not at 0: a session
+ *                    going on in a new process (native/core/log.c)
  *   mods=FILE        the run's mods and cheats (native/core/mods.h)
  *   version=NAME     the core's version, recorded in savestates
  *   scale=N          the render scale
@@ -13,6 +15,9 @@
  *   prebuild=0|1     the cached shaders built before the game (on)
  *   pads=MASK        the players with a controller plugged in (hex, bit n
  *                    player n + 1; default player 1)
+ *   padtypes=T,T,T,T their controllers' types, players 1-4: duke, s, sbc
+ *                    (Steel Battalion), wheel (native/dev/xidtype.h; Duke
+ *                    when absent)
  *   video=FLAGS      the console's video settings (XC_VIDEO_FLAGS, hex)
  *   avpack=hdtv|standard|svideo|scart|vga   its AV cable
  *   lang=N           its language (XC_LANGUAGE: 1 English ... 9 Portuguese)

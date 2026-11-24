@@ -183,15 +183,28 @@ bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel 
         }
     }
 
+    char xmid[HLE_XBE_ID_MAX];
+    hle_xbe_xmid(x, xmid);
     nc_log("hakuX-native-frontier",
-           "stage S0 xbe loaded: title %08x base %08x image %u KiB (%u KiB in memory), %u/%u sections, "
+           "stage S0 xbe loaded: title %08X xmid %s base %08x image %u KiB (%u KiB in memory), %u/%u sections, "
            "entry %08x, %u kernel imports, tls %08x",
-           x->title_id, base, span >> 10, backed >> 10, loaded, x->nsections, x->entry, out->thunks,
+           x->title_id, xmid, base, span >> 10, backed >> 10, loaded, x->nsections, x->entry, out->thunks,
            out->tls_dir);
-    nc_log("hakuX-native-imports", "title %08x %s", x->title_id, imports);
+    nc_log("hakuX-native-imports", "title %08X %s", x->title_id, imports);
+    if (x->nlibs) {
+        char libs[1024] = "";
+        size_t nl = 0;
+        for (unsigned i = 0; i < x->nlibs && nl < sizeof(libs) - 32; i++) {
+            const HleXbeLib *l = &x->libs[i];
+            nl += (size_t)snprintf(libs + nl, sizeof(libs) - nl, "%s%s:%u.%u.%u%s",
+                                   nl ? "," : "", l->name, l->major, l->minor, l->build,
+                                   l->debug_build ? "d" : "");
+        }
+        nc_log("hakuX-native-xbelibs", "title %08X %s", x->title_id, libs);
+    }
     if (nmissing) {
         /* told now, not at the call (that stops the game) */
-        nc_log("hakuX-native-imports", "title %08x imports %u kernel functions not implemented here: %s",
+        nc_log("hakuX-native-imports", "title %08X imports %u kernel functions not implemented here: %s",
                x->title_id, nmissing, missing);
     }
     return true;

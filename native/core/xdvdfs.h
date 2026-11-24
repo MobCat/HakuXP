@@ -21,13 +21,18 @@ extern "C" {
 #define NC_DISC_OVERLAY 0xF0000000u
 
 typedef struct NcDiscOverlay NcDiscOverlay;
+typedef struct NcDiscDirCache NcDiscDirCache;
 
 typedef struct NcDisc {
     int fd;
-    uint64_t part_off;     /* byte offset of the game partition in the image */
+    uint64_t part_off;       /* byte offset of the game partition in the image */
+    uint64_t image_size;     /* host file size in bytes (0 if unknown) */
     uint32_t root_sector;
     uint32_t root_size;
-    NcDiscOverlay *ov;     /* NULL: the disc as it is */
+    bool truncated;          /* an XDVDFS entry or read lies past image_size / EOF */
+    uint64_t truncated_need; /* highest byte offset needed past image_size */
+    NcDiscOverlay *ov;       /* NULL: the disc as it is */
+    NcDiscDirCache *dir_cache; /* cached XDVDFS directory tables (read-only) */
 } NcDisc;
 
 typedef struct NcDiscFile {
@@ -38,6 +43,12 @@ typedef struct NcDiscFile {
 
 bool nc_disc_open(NcDisc *d, int fd);
 void nc_disc_close(NcDisc *d);
+
+/* Walks up to a bounded number of XDVDFS directories to check whether any
+ * non-empty file or directory lies past the end of the image file. Returns
+ * true if intact (or image_size is unknown); false if truncated (setting
+ * d->truncated and d->truncated_need). */
+bool nc_disc_check_intact(NcDisc *d);
 
 /* Finds a path such as "\\default.xbe" or "media/x.bin" (either slash,
  * case-insensitive). */

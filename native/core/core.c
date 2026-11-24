@@ -4,9 +4,15 @@
 #include "native/core/core.h"
 #include "native/dev/dev.h"
 #include "native/dev/usb.h"
+#include "native/dev/inputsync.h"
+#include "native/kernel/detclock.h"
+#include "native/kernel/calltrace.h"
+#include "native/kernel/memtrace.h"
+#include "native/kernel/detevents.h"
 #include "native/hle/hle_native.h"
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
+#include "native/core/smc.h"
 #include "native/net/net.h"
 #include "native/state/save.h"
 
@@ -39,6 +45,24 @@ void nc_core_set_loadstate(const char *path)
     snprintf(g_loadstate, sizeof(g_loadstate), "%s", path ? path : "");
 }
 static bool core_hook_query(void *opaque, uint32_t eip);
+
+static void core_code_page_mark(void *opaque, uint32_t va, uint32_t len)
+{
+    (void)opaque;
+    nc_smc_mark(va, len);
+}
+
+static bool core_smc_page_query(void *opaque, uint32_t va_page)
+{
+    (void)opaque;
+    return nc_smc_is_hot_page(va_page);
+}
+
+static void core_pre_compile(void *opaque)
+{
+    (void)opaque;
+    nc_smc_flush_pending();
+}
 
 /* An XBE header's certificate: the title ID and version. */
 static bool xbe_title(const uint8_t *h, size_t len, uint32_t *tid, uint32_t *ver)
@@ -84,8 +108,8 @@ static bool title_update(const NcDisc *disc, const char *path, char *out, size_t
         fclose(fp);
     }
     if (!read || !xbe_title(u, sizeof(u), &utid, &uver) || utid != tid || uver < ver) {
-        nc_log("hakuX-native-frontier", "title update %s: not this title's newer version (title %08x version %x, "
-               "the disc's %08x %x): the disc's boots", out, read ? utid : 0, read ? uver : 0, tid, ver);
+        nc_log("hakuX-native-frontier", "title update %s: not this title's newer version (title %08X version %x, "
+               "the disc's %08X %x): the disc's boots", out, read ? utid : 0, read ? uver : 0, tid, ver);
         return false;
     }
     nc_log("hakuX-native-frontier", "title update: %s (version %x, the disc's %x) boots for %s", out, uver, ver, path);
@@ -130,6 +154,23 @@ bool nc_core_boot(NcCore *c, int disc_fd)
             close(disc_fd);
             return boot_failed("The game's file isn't an Xbox disc image.");
         }
+        if (!nc_disc_check_intact(&c->disc)) {
+            char why[256];
+            const unsigned have_mb = (unsigned)((c->disc.image_size + (512u << 10)) >> 20);
+            const unsigned need_mb = (unsigned)((c->disc.truncated_need + (512u << 10)) >> 20);
+            if (need_mb > have_mb) {
+                snprintf(why, sizeof(why),
+                         "This ISO image is incomplete or damaged.\n"
+                         "(%u MiB out of %u MiB total)\n"
+                         "Delete this ISO and copy the full ISO again.",
+                         have_mb, need_mb);
+            } else {
+                snprintf(why, sizeof(why),
+                         "This ISO image is incomplete or damaged.\n"
+                         "Delete this ISO and copy the full ISO again.");
+            }
+            return boot_failed(why);
+        }
         nc_mods_install(&c->disc);      /* the mods' files and XBE patches, the cheats */
     } else if (!g_dashboard && !g_loadstate[0]) {
         return boot_failed("The game's file can't be opened.");
@@ -138,10 +179,11 @@ bool nc_core_boot(NcCore *c, int disc_fd)
      * the XBE the saved launch data page names, and the page for the title. */
     static uint8_t page[NC_LAUNCH_PAGE];
     bool have_page = false;
+    const char *dash_path = nc_kernel_dashboard_path();
     char xbe_path[NC_LAUNCH_PAGE] = "\\default.xbe";
     if (g_dashboard) {
-        snprintf(xbe_path, sizeof(xbe_path), "%s", NC_DASHBOARD_PATH);
-        snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", NC_DASHBOARD_PATH);
+        snprintf(xbe_path, sizeof(xbe_path), "%s", dash_path);
+        snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", dash_path);
     }
     if (g_loadstate[0]) {
         /* a savestate: the XBE it was running (a relaunched title's own, the
@@ -174,8 +216,8 @@ bool nc_core_boot(NcCore *c, int disc_fd)
                    *(const uint32_t *)page);
         } else {
             have_page = false;
-            snprintf(xbe_path, sizeof(xbe_path), "%s", g_dashboard ? NC_DASHBOARD_PATH : "\\default.xbe");
-            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", g_dashboard ? NC_DASHBOARD_PATH : "");
+            snprintf(xbe_path, sizeof(xbe_path), "%s", g_dashboard ? dash_path : "\\default.xbe");
+            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", g_dashboard ? dash_path : "");
             nc_log("hakuX-native-frontier", "relaunch: no launch data page, booting %s", xbe_path);
         }
     }
@@ -188,9 +230,11 @@ bool nc_core_boot(NcCore *c, int disc_fd)
     }
     if (!nc_xbe_load(&c->vm, &c->disc, xbe_path, &c->kernel, &c->xbe)) {
         char why[256], host[512];
-        if (!strcasecmp(xbe_path, NC_DASHBOARD_PATH) && !nc_io_host_file(xbe_path, host, sizeof(host))) {
-            return boot_failed("The dashboard isn't installed: its files (xboxdash.xbe and its folders) go on "
-                               "the hard disk's C: drive.");
+        if (!strcasecmp(xbe_path, dash_path) && !nc_io_host_file(xbe_path, host, sizeof(host))) {
+            nc_hle_set_fatal(NC_FATAL_DASHBOARD,
+                             "An Xbox dashboard is not installed. Install an Xbox dashboard in HakuXP to use this "
+                             "feature.");
+            return false;
         }
         const char *name = strrchr(xbe_path, '\\');
         snprintf(why, sizeof(why), "The game's program (%s) can't be loaded: it's damaged, or hakuX doesn't support "
@@ -209,6 +253,9 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         .sysop = nc_kernel_sysop,
         .opaque = &c->kernel,
         .hook_query = core_hook_query,
+        .code_page_mark = core_code_page_mark,
+        .smc_page_query = core_smc_page_query,
+        .pre_compile = core_pre_compile,
         .idt_base = c->kernel.idt_va,
         .idt_limit = 0x7FF,
     };
@@ -216,6 +263,7 @@ bool nc_core_boot(NcCore *c, int disc_fd)
     if (!c->cpu) {
         return boot_failed("The emulated CPU couldn't start.");
     }
+    nc_smc_init(&c->vm, c->cpu);
     nc_mods_bind(&c->vm, c->cpu, &c->xbe.info);
 
     uint32_t stack = MAIN_STACK_SIZE;
@@ -234,6 +282,12 @@ bool nc_core_boot(NcCore *c, int disc_fd)
     c->kernel.hle_after_sysop = nc_hle_after_sysop;
     nc_hle_boot(&c->kernel, &c->vm, c->cpu, &g_boot->ctx);
     nc_state_attach(c);
+    /* A playbook's APU runs no frame of its own from the load on (its frame
+     * thread ran a frame or none before the lockstep began: one run's
+     * DirectSound counters an EP frame ahead); its count starts below. */
+    if (nc_inputsync_on()) {
+        nc_dev_apu_lockstep(true, 0);
+    }
     if (g_loadstate[0]) {
         const char *err = nc_state_load(g_loadstate);
         if (err) {
@@ -245,6 +299,21 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         nc_kernel_loaded_fixups(&c->kernel);
         nc_mods_after_load(&c->kernel, c->kernel.image_path);
         g_loaded = true;
+    }
+    nc_calltrace_init();            /* debug: NC_TRACE_EIP */
+    nc_memtrace_init();             /* debug: NC_TRACE_MEM */
+    /* A playbook playing or recording (begun before the core): the title's
+     * clocks run on its own vblanks, from the state's exact time, or a
+     * boot's fixed one (detclock.h), before anything is translated. */
+    if (nc_inputsync_on()) {
+        uint64_t ns = 0, cycles = 0;
+        if (g_loaded && nc_kern_state_loaded_clock(&ns, &cycles)) {
+            nc_detclock_start(&c->kernel, ns, nc_cpu_tsc_of_cycles(cycles));
+        } else {
+            nc_ke_det_epoch();
+            nc_detclock_start(&c->kernel, 0, 0);
+        }
+        nc_detev_start();           /* and its vblank at the title's own points */
     }
     return true;
 }
@@ -277,7 +346,8 @@ void nc_core_run(NcCore *c)
 /* Hooked guest addresses: the HLE GPU's functions and device-access sites. */
 static bool core_hook_query(void *opaque, uint32_t eip)
 {
-    return nc_x86mmio_is_site(eip) || nc_hle_hook_query(opaque, eip);
+    return nc_x86mmio_is_site(eip) || nc_hle_hook_query(opaque, eip) || nc_detclock_hook_query(eip) ||
+           nc_calltrace_hook_query(eip);
 }
 
 /* A fault in translated code the core can't take as the guest's: where the
@@ -409,6 +479,21 @@ bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
             }
         }
     }
+    bool want_dirty = false;
+    if (nc_smc_fault(info, ucontext, &want_dirty)) {
+        if (want_dirty) {
+            if (nc_hle_dirty_fault(info, ucontext)) {
+                __atomic_fetch_add(&g_nc_faults_dirty, 1, __ATOMIC_RELAXED);
+            } else {
+                const uint64_t gva = nc_vm_guest_of(&c->vm, info->si_addr);
+                const uint32_t gpa = gva != UINT64_MAX ? nc_vm_phys(&c->vm, (uint32_t)gva) : UINT32_MAX;
+                if (gpa != UINT32_MAX) {
+                    nc_vm_smc_sync(&c->vm, gpa & ~(NC_PAGE - 1));
+                }
+            }
+        }
+        return true;
+    }
     if (nc_hle_dirty_fault(info, ucontext)) {
         __atomic_fetch_add(&g_nc_faults_dirty, 1, __ATOMIC_RELAXED);
         return true;
@@ -450,8 +535,17 @@ bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
         nc_log("hakuX-native-frontier", "guest fault at %08x (wrapped address), eip %08x", (uint32_t)va,
                nc_frame_eip(f));
     }
-    if (!nc_kernel_page_fault(&c->kernel, f, (uint32_t)va, nc_cpu_fault_is_write(ucontext))) {
-        return fault_report(c, pc, va, "the title doesn't handle it");
+    const bool write = nc_cpu_fault_is_write(ucontext);
+    if (!nc_kernel_page_fault(&c->kernel, f, (uint32_t)va, write)) {
+        /* The title's crash (Halo's NULL + 0xC): the guest stops, not the
+         * process, which closed the whole app before. */
+        nc_log("hakuX-native-frontier", "guest fault: the title doesn't handle it: %s of %08x at eip %08x",
+               write ? "write" : "read", (uint32_t)va, nc_frame_eip(f));
+        nc_kernel_dump_recent(-1);
+        nc_kernel_dump_threads(&c->kernel, -1);
+        nc_kernel_unhandled_fault(&c->kernel, f, (uint32_t)va, write);
+        nc_cpu_fault_resume(c->cpu, ucontext);
+        return true;
     }
     nc_cpu_fault_resume(c->cpu, ucontext);
     return true;

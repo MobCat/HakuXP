@@ -32,6 +32,7 @@ typedef struct NcVm {
     uint8_t *phys;         /* host view of physical RAM outside the guest space (never protected) */
     uint32_t *rmap;        /* per physical page: the user VA mapping it (besides the window), or 0 */
     uint8_t *wp;           /* per physical page: dirty tracking's (NC_WP_*); 0 not tracked */
+    uint8_t *smc;          /* per physical page: SMC code views (NC_SMC_*); 0 no translated code */
     uint8_t *pin;          /* per physical page: NC_PIN_KNOWN | lock count (nc_vm_pin) */
 } NcVm;
 
@@ -40,6 +41,11 @@ typedef struct NcVm {
  * be read-only, and a store through one opens that too, hle/dirty.c). */
 #define NC_WP_CLEAN   1u
 #define NC_WP_WRITTEN 2u
+
+/* NcVm.smc: guest views that have translated JIT code on a physical page. */
+#define NC_SMC_USER   1u
+#define NC_SMC_CONTIG 2u
+#define NC_SMC_GPU    4u
 
 /* A page whose physical address went out (MmGetPhysicalAddress, a title's
  * own page tables) stays where it is until freed; locks count below it. */
@@ -62,6 +68,11 @@ void nc_vm_protect_pages(NcVm *vm, uint32_t pa, uint32_t n, bool ro);
  * wants (off). The host's view (vm->phys) keeps its access. */
 void nc_vm_noaccess(NcVm *vm, uint32_t pa, uint32_t n, bool on);
 bool nc_vm_noaccess_has(NcVm *vm, uint32_t pa);
+
+/* Arm SMC write-protection on every guest view of physical page pa. */
+void nc_vm_smc_protect(NcVm *vm, uint32_t pa, uint8_t view_bit);
+/* Re-apply effective host permissions (g_na, wp, smc) on physical page pa. */
+void nc_vm_smc_sync(NcVm *vm, uint32_t pa);
 
 /* Before host code writes guest memory through a system call (read/pread
  * into a guest buffer: a protected page fails the call instead of faulting):

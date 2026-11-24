@@ -35,9 +35,17 @@ bool nc_option(NcOptions *o, const char *arg)
         nc_core_set_relaunch(true);
     } else if (!strcmp(arg, "dash")) {
         nc_core_set_dashboard(true);            /* no disc: the disc argument is "none" */
+    } else if ((v = value(arg, "dashpath="))) {
+        nc_kernel_set_dashboard_path(v);        /* dashboard XBE path (default C:\xboxdash.xbe) */
+        nc_log("hakuX-app", "dashboard path %s", nc_kernel_dashboard_path());
     } else if ((v = value(arg, "loadstate="))) {
         nc_core_set_loadstate(v);
         nc_log("hakuX-app", "savestate %s", v);
+    } else if ((v = value(arg, "ec="))) {
+        /* the session's emulation count goes on from here (hex): a state's
+         * load or a relaunch in a new process (native/core/log.c) */
+        nc_log_count_start(strtoull(v, NULL, 16));
+        nc_log("hakuX-app", "emulation count from %s", v);
     } else if ((v = value(arg, "mods="))) {
         nc_mods_set_manifest(v);                /* read as the disc opens */
     } else if ((v = value(arg, "version="))) {
@@ -53,6 +61,8 @@ bool nc_option(NcOptions *o, const char *arg)
         nc_io_set_device_time(atoi(v) != 0);    /* console timing (native/kernel/io.c) */
     } else if ((v = value(arg, "pads="))) {
         setenv("NC_PAD_MASK", v, 1);            /* read by the USB at boot (ohci.c) */
+    } else if ((v = value(arg, "padtypes="))) {
+        setenv("NC_PAD_TYPES", v, 1);           /* the same */
     } else if ((v = value(arg, "video="))) {
         o->video = (int64_t)strtoul(v, NULL, 16);
     } else if ((v = value(arg, "avpack="))) {
@@ -68,6 +78,10 @@ bool nc_option(NcOptions *o, const char *arg)
         nc_kernel_set_clock(strtoll(v, NULL, 10));  /* none: the phone's time */
     } else if ((v = value(arg, "tz="))) {
         nc_kernel_set_time_zone(atoi(v));           /* none: the phone's zone */
+    } else if ((v = value(arg, "tzinfo="))) {
+        if (!nc_kernel_set_time_zone_info(v)) {     /* none: tz='s bias alone */
+            nc_log("hakuX-app", "tzinfo: not 44 bytes in hex, the offset alone kept: %s", v);
+        }
     } else {
         return false;
     }

@@ -58,8 +58,9 @@ bool nc_vm_init(NcVm *vm, uint32_t ram_size)
     vm->pte = calloc((1ull << 32) / NC_PAGE, sizeof(uint32_t));
     vm->rmap = calloc(ram_size / NC_PAGE, sizeof(uint32_t));
     vm->wp = calloc(ram_size / NC_PAGE, 1);
+    vm->smc = calloc(ram_size / NC_PAGE, 1);
     vm->pin = calloc(ram_size / NC_PAGE, 1);
-    if (!vm->page_used || !vm->pte || !vm->rmap || !vm->wp || !vm->pin) {
+    if (!vm->page_used || !vm->pte || !vm->rmap || !vm->wp || !vm->smc || !vm->pin) {
         return false;
     }
 
@@ -118,10 +119,11 @@ bool nc_vm_map(NcVm *vm, uint32_t va, uint32_t pa, uint32_t len)
             }
             vm->rmap[page] = va + off;
         }
-        if (g_na && g_na[page]) {
+        if (g_na && __atomic_load_n(&g_na[page], __ATOMIC_ACQUIRE)) {
             mprotect(vm->base + va + off, NC_PAGE, PROT_NONE); /* still no access (nc_vm_noaccess) */
-        } else if (vm->wp[page] == NC_WP_CLEAN) {
-            mprotect(vm->base + va + off, NC_PAGE, PROT_READ); /* still tracked */
+        } else if (__atomic_load_n(&vm->wp[page], __ATOMIC_ACQUIRE) == NC_WP_CLEAN ||
+                   __atomic_load_n(&vm->smc[page], __ATOMIC_ACQUIRE) != 0) {
+            mprotect(vm->base + va + off, NC_PAGE, PROT_READ); /* still tracked (dirty or SMC) */
         }
     }
     return true;
@@ -160,6 +162,12 @@ static void prot_views(NcVm *vm, uint32_t page, uint32_t n, int prot)
     }
 }
 
+static bool page_wants_ro(const NcVm *vm, uint32_t page)
+{
+    return __atomic_load_n(&vm->wp[page], __ATOMIC_ACQUIRE) == NC_WP_CLEAN ||
+           __atomic_load_n(&vm->smc[page], __ATOMIC_ACQUIRE) != 0;
+}
+
 void nc_vm_protect_pages(NcVm *vm, uint32_t pa, uint32_t n, bool ro)
 {
     if (!n) {
@@ -176,22 +184,32 @@ void nc_vm_protect_pages(NcVm *vm, uint32_t pa, uint32_t n, bool ro)
             __atomic_store_n(&vm->wp[page + i], NC_WP_CLEAN, __ATOMIC_RELEASE);
         }
     }
-    /* pages without access stay so (nc_vm_noaccess): only the runs between
-     * them change, none opened even for a moment (a guest store there
-     * would go untracked); one closed meanwhile is closed again after */
+    /* Pages without access stay PROT_NONE, and SMC-tracked code pages stay
+     * PROT_READ when dirty tracking unprotects them: only the runs between
+     * them change, none opened even for a moment; any closed meanwhile are
+     * re-closed after. */
     for (uint32_t i = 0; i < n;) {
-        if (g_na && __atomic_load_n(&g_na[page + i], __ATOMIC_ACQUIRE)) {
+        const bool na_i = g_na && __atomic_load_n(&g_na[page + i], __ATOMIC_ACQUIRE);
+        const bool hold_i = !ro && __atomic_load_n(&vm->smc[page + i], __ATOMIC_ACQUIRE) != 0;
+        if (na_i || hold_i) {
             i++;
             continue;
         }
         uint32_t k = 1;
-        while (i + k < n && !(g_na && __atomic_load_n(&g_na[page + i + k], __ATOMIC_ACQUIRE))) {
+        while (i + k < n) {
+            const bool na_k = g_na && __atomic_load_n(&g_na[page + i + k], __ATOMIC_ACQUIRE);
+            const bool hold_k = !ro && __atomic_load_n(&vm->smc[page + i + k], __ATOMIC_ACQUIRE) != 0;
+            if (na_k || hold_k) {
+                break;
+            }
             k++;
         }
         prot_views(vm, page + i, k, prot);
-        for (uint32_t j = i; g_na && j < i + k; j++) {
-            if (__atomic_load_n(&g_na[page + j], __ATOMIC_ACQUIRE)) {
+        for (uint32_t j = i; j < i + k; j++) {
+            if (g_na && __atomic_load_n(&g_na[page + j], __ATOMIC_ACQUIRE)) {
                 prot_views(vm, page + j, 1, PROT_NONE);
+            } else if (!ro && __atomic_load_n(&vm->smc[page + j], __ATOMIC_ACQUIRE) != 0) {
+                prot_views(vm, page + j, 1, PROT_READ);
             }
         }
         i += k;
@@ -227,14 +245,14 @@ void nc_vm_noaccess(NcVm *vm, uint32_t pa, uint32_t n, bool on)
         prot_views(vm, page, n, PROT_NONE);
         return;
     }
-    /* back to what write tracking wants, in runs of the same */
+    /* back to what write tracking and SMC want, in runs of the same */
     for (uint32_t i = 0; i < n;) {
-        const uint8_t wp = __atomic_load_n(&vm->wp[page + i], __ATOMIC_ACQUIRE);
+        const bool want_ro = page_wants_ro(vm, page + i);
         uint32_t k = 1;
-        while (i + k < n && __atomic_load_n(&vm->wp[page + i + k], __ATOMIC_ACQUIRE) == wp) {
+        while (i + k < n && page_wants_ro(vm, page + i + k) == want_ro) {
             k++;
         }
-        prot_views(vm, page + i, k, wp == NC_WP_CLEAN ? PROT_READ : PROT_READ | PROT_WRITE);
+        prot_views(vm, page + i, k, want_ro ? PROT_READ : PROT_READ | PROT_WRITE);
         i += k;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -250,6 +268,39 @@ bool nc_vm_noaccess_has(NcVm *vm, uint32_t pa)
 void nc_vm_protect_page(NcVm *vm, uint32_t pa, bool ro)
 {
     nc_vm_protect_pages(vm, pa & ~(NC_PAGE - 1), 1, ro);
+}
+
+void nc_vm_smc_protect(NcVm *vm, uint32_t pa, uint8_t view_bit)
+{
+    const uint32_t page = pa / NC_PAGE;
+    if (!vm || !vm->smc || !view_bit || page >= vm->ram_size / NC_PAGE) {
+        return;
+    }
+    const uint8_t prev = __atomic_fetch_or(&vm->smc[page], view_bit, __ATOMIC_ACQ_REL);
+    if (!prev && !(g_na && __atomic_load_n(&g_na[page], __ATOMIC_ACQUIRE))) {
+        prot_views(vm, page, 1, PROT_READ);
+        if (g_na && __atomic_load_n(&g_na[page], __ATOMIC_ACQUIRE)) {
+            prot_views(vm, page, 1, PROT_NONE);
+        }
+    }
+}
+
+void nc_vm_smc_sync(NcVm *vm, uint32_t pa)
+{
+    const uint32_t page = pa / NC_PAGE;
+    if (!vm || !vm->smc || page >= vm->ram_size / NC_PAGE) {
+        return;
+    }
+    if (g_na && __atomic_load_n(&g_na[page], __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    const int prot = page_wants_ro(vm, page) ? PROT_READ : PROT_READ | PROT_WRITE;
+    prot_views(vm, page, 1, prot);
+    if (g_na && __atomic_load_n(&g_na[page], __ATOMIC_ACQUIRE)) {
+        prot_views(vm, page, 1, PROT_NONE);
+    } else if (prot != PROT_READ && page_wants_ro(vm, page)) {
+        prot_views(vm, page, 1, PROT_READ);
+    }
 }
 
 bool nc_vm_unmap(NcVm *vm, uint32_t va, uint32_t len)
@@ -349,6 +400,9 @@ void nc_vm_free_phys(NcVm *vm, uint32_t pa, uint32_t len)
                     nc_log("hakuX-native", "vm: pa %08x freed while %08x still maps it", p * NC_PAGE, va);
                 }
             }
+            if (vm->smc && __atomic_exchange_n(&vm->smc[p], 0, __ATOMIC_ACQ_REL) != 0) {
+                nc_vm_smc_sync(vm, p * NC_PAGE);
+            }
         }
         memset(vm->page_used + pa / NC_PAGE, 0, pages);
         memset(vm->pin + pa / NC_PAGE, 0, pages);
@@ -411,13 +465,25 @@ static bool relocate(NcVm *vm, uint32_t q, uint32_t to)
     }
     const uint32_t va = vm->rmap[q];
     memcpy(vm->ram + (size_t)to * NC_PAGE, vm->ram + (size_t)q * NC_PAGE, NC_PAGE);
+    const uint8_t smc_q = vm->smc ? __atomic_exchange_n(&vm->smc[q], 0, __ATOMIC_ACQ_REL) : 0;
+    if (smc_q) {
+        __atomic_store_n(&vm->smc[to], smc_q, __ATOMIC_RELEASE);
+    }
     vm->page_used[to] = 1;
     if (!nc_vm_map(vm, va, to * NC_PAGE, NC_PAGE)) {
+        if (smc_q) {
+            __atomic_store_n(&vm->smc[to], 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&vm->smc[q], smc_q, __ATOMIC_RELEASE);
+        }
         vm->page_used[to] = 0;
         return false;
     }
     vm->rmap[q] = 0;
     vm->page_used[q] = 0;
+    if (smc_q) {
+        nc_vm_smc_sync(vm, to * NC_PAGE);
+        nc_vm_smc_sync(vm, q * NC_PAGE);
+    }
     if (tracked && nc_vm_dma.wrote) {
         nc_vm_dma.wrote(q * NC_PAGE, NC_PAGE);
         nc_vm_dma.wrote(to * NC_PAGE, NC_PAGE);

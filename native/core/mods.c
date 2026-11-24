@@ -175,7 +175,9 @@ static bool update_host(NcDisc *disc, const char *xbe, char *out, size_t n)
     if (!xbe_info(disc, "default.xbe", &x)) {
         return false;
     }
-    snprintf(path, sizeof(path), "\\Device\\Harddisk0\\Partition1\\TDATA\\%08x\\$u\\%s", x.title_id, xbe + 3);
+    /* Upper case like every title ID HakuXP prints; the lookup matches names
+     * case-insensitively (FATX), so the dashboard's lowercase folder is found. */
+    snprintf(path, sizeof(path), "\\Device\\Harddisk0\\Partition1\\TDATA\\%08X\\$u\\%s", x.title_id, xbe + 3);
     return nc_io_host_file(path, out, n);
 }
 

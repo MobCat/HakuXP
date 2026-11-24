@@ -11,7 +11,9 @@
 #include "native/core/xdvdfs.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -27,7 +29,11 @@ static bool pread_all(int fd, void *buf, size_t len, uint64_t off)
     uint8_t *p = buf;
     while (len) {
         ssize_t n = pread(fd, p, len, (off_t)off);
-        if (n <= 0) {
+        if (n < 0) {
+            return false;
+        }
+        if (n == 0) {
+            errno = EIO; /* unexpected EOF: never report errno 0 ("Success") */
             return false;
         }
         p += n;
@@ -37,10 +43,129 @@ static bool pread_all(int fd, void *buf, size_t len, uint64_t off)
     return true;
 }
 
+static void note_truncated(const NcDisc *d, uint64_t need)
+{
+    NcDisc *m = (NcDisc *)d;
+    const bool first = !__atomic_exchange_n(&m->truncated, true, __ATOMIC_RELAXED);
+    uint64_t prev = __atomic_load_n(&m->truncated_need, __ATOMIC_RELAXED);
+    while (need > prev &&
+           !__atomic_compare_exchange_n(&m->truncated_need, &prev, need, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+    if (first) {
+        if (d->image_size) {
+            nc_log("hakuX-native", "disc: read past end of image (need %.1f MiB, file is %.1f MiB)",
+                   (double)need / (1024.0 * 1024.0), (double)d->image_size / (1024.0 * 1024.0));
+        } else {
+            nc_log("hakuX-native", "disc: read past end of image at offset 0x%llx", (unsigned long long)need);
+        }
+    }
+}
+
+/* In-memory cache of read-only XDVDFS directory tables. Avoids synchronous
+ * pread() syscalls on the guest CPU thread when streaming titles reopen files
+ * under nested directories on SD cards. */
+enum {
+    DIR_CACHE_MAX = 256,
+    DIR_CACHE_BYTES = 4u << 20,
+};
+
+typedef struct DirCacheEntry {
+    uint32_t sector;
+    uint32_t size;
+    uint8_t *data;
+} DirCacheEntry;
+
+struct NcDiscDirCache {
+    pthread_mutex_t mu;
+    DirCacheEntry e[DIR_CACHE_MAX];
+    unsigned n;
+    size_t bytes;
+};
+
+static NcDiscDirCache *dir_cache_open(void)
+{
+    NcDiscDirCache *c = calloc(1, sizeof(*c));
+    if (c && pthread_mutex_init(&c->mu, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
+    return c;
+}
+
+static void dir_cache_close(NcDisc *d)
+{
+    NcDiscDirCache *c = d->dir_cache;
+    if (!c) {
+        return;
+    }
+    for (unsigned i = 0; i < c->n; i++) {
+        free(c->e[i].data);
+    }
+    pthread_mutex_destroy(&c->mu);
+    free(c);
+    d->dir_cache = NULL;
+}
+
+/* Returns a directory table's bytes from cache or disc. When *owned is true
+ * the caller must free() the returned buffer; cached buffers stay valid until
+ * nc_disc_close(). */
+static const uint8_t *dir_read(const NcDisc *d, uint32_t sector, uint32_t size, bool *owned)
+{
+    *owned = false;
+    NcDiscDirCache *c = d->dir_cache;
+    if (c) {
+        pthread_mutex_lock(&c->mu);
+        for (unsigned i = 0; i < c->n; i++) {
+            if (c->e[i].sector == sector && c->e[i].size == size) {
+                const uint8_t *hit = c->e[i].data;
+                pthread_mutex_unlock(&c->mu);
+                return hit;
+            }
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    uint8_t *buf = malloc(size);
+    if (!buf) {
+        return NULL;
+    }
+    const uint64_t dir_off = d->part_off + (uint64_t)sector * NC_XDVDFS_SECTOR;
+    if (!pread_all(d->fd, buf, size, dir_off)) {
+        if (errno == EIO || (d->image_size && dir_off + size > d->image_size)) {
+            note_truncated(d, dir_off + size);
+        }
+        free(buf);
+        return NULL;
+    }
+    if (c) {
+        pthread_mutex_lock(&c->mu);
+        for (unsigned i = 0; i < c->n; i++) {
+            if (c->e[i].sector == sector && c->e[i].size == size) {
+                const uint8_t *hit = c->e[i].data;
+                pthread_mutex_unlock(&c->mu);
+                free(buf);
+                return hit;
+            }
+        }
+        if (c->n < DIR_CACHE_MAX && c->bytes + size <= DIR_CACHE_BYTES) {
+            c->e[c->n++] = (DirCacheEntry){sector, size, buf};
+            c->bytes += size;
+            pthread_mutex_unlock(&c->mu);
+            return buf;
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    *owned = true;
+    return buf;
+}
+
 bool nc_disc_open(NcDisc *d, int fd)
 {
     memset(d, 0, sizeof(*d));
     d->fd = fd;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        d->image_size = (uint64_t)st.st_size;
+    }
     for (size_t i = 0; i < sizeof(k_part_offsets) / sizeof(k_part_offsets[0]); i++) {
         uint8_t vd[NC_XDVDFS_SECTOR];
         uint64_t off = k_part_offsets[i];
@@ -51,8 +176,10 @@ bool nc_disc_open(NcDisc *d, int fd)
             d->part_off = off;
             d->root_sector = nc_rd32(vd + 20);
             d->root_size = nc_rd32(vd + 24);
-            nc_log("hakuX-native", "disc: XDVDFS at +0x%llx, root sector %u (%u bytes)",
-                   (unsigned long long)off, d->root_sector, d->root_size);
+            d->dir_cache = dir_cache_open();
+            nc_log("hakuX-native", "disc: XDVDFS at +0x%llx, root sector %u (%u bytes), image %.1f MiB",
+                   (unsigned long long)off, d->root_sector, d->root_size,
+                   (double)d->image_size / (1024.0 * 1024.0));
             return true;
         }
     }
@@ -60,8 +187,118 @@ bool nc_disc_open(NcDisc *d, int fd)
     return false;
 }
 
+typedef struct CheckDir {
+    uint32_t sector;
+    uint32_t size;
+} CheckDir;
+
+typedef struct CheckCtx {
+    NcDisc *d;
+    CheckDir *q;
+    unsigned qlen;
+    unsigned qcap;
+    const uint8_t *dir;
+    uint32_t dir_size;
+    uint8_t *visited;
+} CheckCtx;
+
+static void check_entry(CheckCtx *c, uint32_t off, unsigned depth)
+{
+    if (off + 14 > c->dir_size || depth > 64) {
+        return;
+    }
+    const uint32_t slot = off >> 2;
+    if (c->visited[slot >> 3] & (1u << (slot & 7))) {
+        return;
+    }
+    c->visited[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+
+    const uint8_t *e = c->dir + off;
+    const uint16_t left = nc_rd16(e), right = nc_rd16(e + 2);
+    if (left == 0xFFFF && right == 0xFFFF && e[12] == 0xFF) {
+        return;
+    }
+    const uint32_t fsec = nc_rd32(e + 4);
+    const uint32_t fsize = nc_rd32(e + 8);
+    const uint8_t attr = e[12];
+    if (fsize > 0) {
+        const uint64_t end = c->d->part_off + (uint64_t)fsec * NC_XDVDFS_SECTOR + fsize;
+        if (end > c->d->image_size) {
+            c->d->truncated = true;
+            if (end > c->d->truncated_need) {
+                c->d->truncated_need = end;
+            }
+        } else if ((attr & 0x10) && c->qlen < c->qcap) {
+            c->q[c->qlen++] = (CheckDir){fsec, fsize};
+        }
+    }
+    if (left && left != 0xFFFF) {
+        check_entry(c, left * 4u, depth + 1);
+    }
+    if (right && right != 0xFFFF) {
+        check_entry(c, right * 4u, depth + 1);
+    }
+}
+
+bool nc_disc_check_intact(NcDisc *d)
+{
+    if (!d || d->fd < 0 || !d->image_size || !d->root_size) {
+        return true;
+    }
+    const uint64_t root_end = d->part_off + (uint64_t)d->root_sector * NC_XDVDFS_SECTOR + d->root_size;
+    if (root_end > d->image_size) {
+        d->truncated = true;
+        d->truncated_need = root_end;
+        nc_log("hakuX-native", "disc: image is truncated (%.1f MiB, needs at least %.1f MiB)",
+               (double)d->image_size / (1024.0 * 1024.0), (double)d->truncated_need / (1024.0 * 1024.0));
+        return false;
+    }
+    /* Walk up to 256 directories breadth-first (~10 ms on SD card) to catch
+     * truncated downloads or interrupted copies before the title boots. */
+    enum { MAX_DIRS = 256 };
+    CheckDir q[MAX_DIRS];
+    q[0] = (CheckDir){d->root_sector, d->root_size};
+    CheckCtx ctx = {.d = d, .q = q, .qlen = 1, .qcap = MAX_DIRS};
+    for (unsigned i = 0; i < ctx.qlen; i++) {
+        const uint32_t sz = q[i].size;
+        if (!sz || sz > (1u << 20)) {
+            continue;
+        }
+        const size_t vbytes = ((sz >> 2) + 7) >> 3;
+        uint8_t *vis = calloc(vbytes ? vbytes : 1, 1);
+        if (!vis) {
+            break;
+        }
+        const uint64_t off = d->part_off + (uint64_t)q[i].sector * NC_XDVDFS_SECTOR;
+        bool owned = false;
+        const uint8_t *buf = dir_read(d, q[i].sector, sz, &owned);
+        if (buf) {
+            ctx.dir = buf;
+            ctx.dir_size = sz;
+            ctx.visited = vis;
+            check_entry(&ctx, 0, 0);
+            if (owned) {
+                free((void *)buf);
+            }
+        } else {
+            d->truncated = true;
+            if (off + sz > d->truncated_need) {
+                d->truncated_need = off + sz;
+            }
+        }
+        free(vis);
+    }
+    if (d->truncated) {
+        nc_log("hakuX-native", "disc: image is truncated (%.1f MiB, needs at least %.1f MiB)",
+               (double)d->image_size / (1024.0 * 1024.0), (double)d->truncated_need / (1024.0 * 1024.0));
+        return false;
+    }
+    return true;
+}
+
 void nc_disc_close(NcDisc *d)
 {
+    dir_cache_close(d);
     if (d->fd >= 0) {
         close(d->fd);
     }
@@ -123,14 +360,12 @@ static bool disc_find(const NcDisc *d, const char *path, NcDiscFile *out)
         if (!(cur.attr & 0x10) || !cur.size) {
             return false;
         }
-        uint8_t *dir = malloc(cur.size);
-        if (!dir) {
-            return false;
+        bool owned = false;
+        const uint8_t *dir = dir_read(d, cur.sector, cur.size, &owned);
+        bool ok = dir && dir_search(dir, cur.size, 0, p, (size_t)(end - p), &cur, 0);
+        if (owned) {
+            free((void *)dir);
         }
-        bool ok = pread_all(d->fd, dir, cur.size,
-                            d->part_off + (uint64_t)cur.sector * NC_XDVDFS_SECTOR) &&
-                  dir_search(dir, cur.size, 0, p, (size_t)(end - p), &cur, 0);
-        free(dir);
         if (!ok) {
             return false;
         }
@@ -410,9 +645,17 @@ bool nc_disc_read_file(const NcDisc *d, const NcDiscFile *f, uint64_t off, void 
     if (off + len > f->size) {
         return false;
     }
-    return f->sector >= NC_DISC_OVERLAY
-               ? ov_read(d, f, off, buf, len)
-               : pread_all(d->fd, buf, len, d->part_off + (uint64_t)f->sector * NC_XDVDFS_SECTOR + off);
+    if (f->sector >= NC_DISC_OVERLAY) {
+        return ov_read(d, f, off, buf, len);
+    }
+    const uint64_t pos = d->part_off + (uint64_t)f->sector * NC_XDVDFS_SECTOR + off;
+    if (!pread_all(d->fd, buf, len, pos)) {
+        if (errno == EIO || (d->image_size && pos + len > d->image_size)) {
+            note_truncated(d, pos + len);
+        }
+        return false;
+    }
+    return true;
 }
 
 bool nc_disc_read(const NcDisc *d, const NcDiscFile *f, uint64_t off, void *buf, size_t len)
