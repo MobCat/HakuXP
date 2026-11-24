@@ -16,6 +16,8 @@
 #include "hw/xbox/hle/vk/back.h"
 #include "hw/xbox/hle/vk/display.h"
 
+#include <sched.h>
+
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -75,6 +77,7 @@ static struct {
     HleThread th;
     HleSem kick;
     uint32_t kicks;                     /* hle_pb_kick calls */
+    uint32_t passed;                    /* (atomic) the kicks a finished pass covered */
     HlePusher p;
     bool synced;                        /* the pusher's DMA object and GET are the GPU's */
     uint32_t inst;
@@ -1296,10 +1299,44 @@ static bool decoder_held(void)
     return g_pb.trap_wait || g_pb.flip_wait || !fifo_open();
 }
 
+/* Playbooks (native/dev/inputsync.h): the scout runs at every PUT for the
+ * frames the title pushed, reports or not. */
+static bool g_sc_count;
+
+void hle_pb_count_frames(bool on)
+{
+    __atomic_store_n(&g_sc_count, on, __ATOMIC_RELEASE);
+}
+
+bool hle_pb_frames_pushed(uint32_t *n)
+{
+    if (!__atomic_load_n(&g_sc_count, __ATOMIC_ACQUIRE) || !g_pb.on) {
+        return false;
+    }
+    *n = g_sc.frame;            /* 0 before the title's first PUT */
+    return true;
+}
+
+void hle_pb_quiescent_why(char *buf, size_t n)
+{
+    snprintf(buf, n, "GET %08x PUT %08x%s%s%s%s", g_pb.p.get, hle_host_gpu_reg(NV_PFIFO_CACHE1_DMA_PUT),
+             g_pb.flip_wait ? " flip-stall" : "", g_pb.trap_wait ? " trap" : "", fifo_open() ? "" : " fifo-off",
+             g_pb.in_run ? " decoding" : "");
+}
+
+bool hle_pb_quiescent(void)
+{
+    if (!g_pb.on) {
+        return true;
+    }
+    return g_pb.p.get == hle_host_gpu_reg(NV_PFIFO_CACHE1_DMA_PUT) || decoder_held();
+}
+
 void hle_pb_pushed(uint32_t put)
 {
-    /* armed by the decoder (GET_REPORT): the scout syncs at this PUT */
-    if (__atomic_load_n(&g_sc_on, __ATOMIC_ACQUIRE)) {
+    /* armed by the decoder (GET_REPORT), or a playbook's frame count: the
+     * scout syncs at this PUT */
+    if (__atomic_load_n(&g_sc_on, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_sc_count, __ATOMIC_ACQUIRE)) {
         scout_to(put);
     }
 }
@@ -1495,6 +1532,7 @@ static void *decode_thread(void *opaque)
             }
             const uint32_t seen = __atomic_load_n(&g_pb.kicks, __ATOMIC_ACQUIRE);
             consume();
+            __atomic_store_n(&g_pb.passed, seen, __ATOMIC_RELEASE);    /* hle_pb_settle */
             if (park_due()) {
                 park();
             }
@@ -1504,6 +1542,53 @@ static void *decode_thread(void *opaque)
         }
     }
     return NULL;
+}
+
+/* Playbooks: the guest's write that let the decoder go on waits for it
+ * (hle_pb_settle). */
+static bool g_lockstep;
+static unsigned g_settle_late;
+
+#define SETTLE_MAX_NS 50000000ll    /* 50 ms: then the guest goes on, and it's logged */
+
+void hle_pb_lockstep(bool on)
+{
+    __atomic_store_n(&g_lockstep, on, __ATOMIC_RELEASE);
+}
+
+bool hle_pb_lockstep_on(void)
+{
+    return g_pb.on && __atomic_load_n(&g_lockstep, __ATOMIC_ACQUIRE);
+}
+
+/* A pass that began after kick k has ended, the decoder at PUT or held. */
+static bool settled(uint32_t k)
+{
+    return (int32_t)(__atomic_load_n(&g_pb.passed, __ATOMIC_ACQUIRE) - k) >= 0 && hle_pb_quiescent();
+}
+
+void hle_pb_settle(void)
+{
+    if (!g_pb.on || t_decoder || !__atomic_load_n(&g_lockstep, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    const uint32_t k = __atomic_load_n(&g_pb.kicks, __ATOMIC_ACQUIRE);
+    if (settled(k)) {
+        return;
+    }
+    hle_host_guest_hold(true);          /* the guest's time stands still meanwhile */
+    const int64_t t0 = hle_now_ns();
+    bool ok;
+    while (!(ok = settled(k)) && hle_now_ns() - t0 < SETTLE_MAX_NS) {
+        sched_yield();
+    }
+    hle_host_guest_hold(false);
+    if (!ok && (g_settle_late++ < 8 || g_settle_late % 100 == 0)) {
+        char why[160];
+        hle_pb_quiescent_why(why, sizeof(why));
+        hle_log("hakuX-hle-pb", "lockstep: the decoder not done %lld ms after the guest's write (%u so far): %s",
+                (long long)(SETTLE_MAX_NS / 1000000), g_settle_late, why);
+    }
 }
 
 void hle_pb_debug_pos(uint32_t *get, uint32_t *put)

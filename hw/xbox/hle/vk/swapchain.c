@@ -28,6 +28,7 @@
  * swapchain, none drops them.
  */
 #include "hw/xbox/hle/base.h"
+#include "hw/xbox/hle/util/stamp.h"
 #include "hw/xbox/hle/hle.h"
 #include "hw/xbox/hle/shader/glsl_compile.h"
 #include "hw/xbox/hle/vk/back_int.h"
@@ -867,6 +868,66 @@ static void rendering(VkCommandBuffer cb, VkImageView v, uint32_t w, uint32_t h,
     T.vkCmdBeginRendering(cb, &ri);
 }
 
+/* hle_present_stamp: the number on the frames presented next. */
+static struct {
+    bool on;
+    uint64_t value;
+} g_stamp;
+
+void hle_present_stamp(bool on, uint64_t value)
+{
+    g_stamp.on = on;
+    g_stamp.value = value;
+}
+
+/* A window rectangle in the image: its corners through the window's clip
+ * space and the pre-rotation (g_ps.rot, as k_vs turns the picture), clamped
+ * to the image. False when nothing of it is left. */
+static bool stamp_rect(const HleStampRect *r, uint32_t ww, uint32_t wh, uint32_t iw, uint32_t ih,
+                       VkClearRect *out)
+{
+    float x0 = (float)iw, y0 = (float)ih, x1 = 0.0f, y1 = 0.0f;
+    for (unsigned c = 0; c < 4; c++) {
+        const float px = (float)(r->x + ((c & 1) ? r->w : 0)), py = (float)(r->y + ((c & 2) ? r->h : 0));
+        const float cx = 2.0f * px / (float)ww - 1.0f, cy = 2.0f * py / (float)wh - 1.0f;
+        const float ix = g_ps.rot[0] * cx + g_ps.rot[1] * cy, iy = g_ps.rot[2] * cx + g_ps.rot[3] * cy;
+        const float qx = (ix + 1.0f) * 0.5f * (float)iw, qy = (iy + 1.0f) * 0.5f * (float)ih;
+        x0 = MIN(x0, qx);
+        y0 = MIN(y0, qy);
+        x1 = MAX(x1, qx);
+        y1 = MAX(y1, qy);
+    }
+    const int32_t ax = (int32_t)MAX(x0 + 0.5f, 0.0f), ay = (int32_t)MAX(y0 + 0.5f, 0.0f);
+    const int32_t bx = (int32_t)MIN(x1 + 0.5f, (float)iw), by = (int32_t)MIN(y1 + 0.5f, (float)ih);
+    if (bx <= ax || by <= ay) {
+        return false;
+    }
+    *out = (VkClearRect){ { { ax, ay }, { (uint32_t)(bx - ax), (uint32_t)(by - ay) } }, 0, 1 };
+    return true;
+}
+
+/* The stamp, in the open rendering of the window's image: a black box, white
+ * segments, as clears (no pipeline). */
+static void draw_stamp(VkCommandBuffer cb, uint32_t ww, uint32_t wh, uint32_t iw, uint32_t ih)
+{
+    HleStampRect box, seg[HLE_STAMP_MAX_SEGMENTS];
+    const int32_t t = MAX(2, (int32_t)MIN(ww, wh) / 216);
+    const unsigned n = hle_stamp_layout(g_stamp.value, 8, (int32_t)ww - t, t, t, &box, seg);
+    VkClearRect rects[HLE_STAMP_MAX_SEGMENTS];
+    if (stamp_rect(&box, ww, wh, iw, ih, &rects[0])) {
+        const VkClearAttachment black = { VK_IMAGE_ASPECT_COLOR_BIT, 0, { .color = { { 0, 0, 0, 1 } } } };
+        T.vkCmdClearAttachments(cb, 1, &black, 1, rects);
+    }
+    unsigned m = 0;
+    for (unsigned i = 0; i < n; i++) {
+        m += stamp_rect(&seg[i], ww, wh, iw, ih, &rects[m]);
+    }
+    if (m) {
+        const VkClearAttachment white = { VK_IMAGE_ASPECT_COLOR_BIT, 0, { .color = { { 1, 1, 1, 1 } } } };
+        T.vkCmdClearAttachments(cb, 1, &white, m, rects);
+    }
+}
+
 /* How the frame meets the window, logged when that changes. */
 static void log_path(unsigned p, bool fxaa, uint32_t vw, uint32_t vh)
 {
@@ -966,6 +1027,9 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
         }
         quad(cb, f, 0, g_ps.pipe[p], src, pc, iw, ih);
         log_path(p, fxaa_done, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));
+    }
+    if (g_stamp.on) {
+        draw_stamp(cb, ww, wh, iw, ih);
     }
     T.vkCmdEndRendering(cb);
     barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,

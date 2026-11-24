@@ -210,6 +210,14 @@ static const HleQuirk k_quirks[] = {
      * releases between are untested, so on for Arm's driver before r40;
      * HAKUX_HLE_QUIRKS=+no_sem_wait tries it elsewhere. */
     { HLE_QUIRK_NO_SEM_WAIT, "no_sem_wait", arm_before_r40 },
+    /* Turnip 26.3.0-devel (Adreno 740, Odin2, 2026-11-20): Serious Sam's
+     * crosshair rendered the next HUD draw's texture (health bar background)
+     * for 1 frame every few seconds (6 glitches in 14 s). Still reproduced
+     * with HAKUX_HLE_VB_COPY=1 (2), TU_DEBUG=sysmem (1) and norec=1 (2);
+     * TU_DEBUG=flushall (0), caps=-bindless (0) and caps=-push (0, same or
+     * higher FPS) all eliminated it. Avoid push constants on Turnip via the
+     * storage-buffer push ring (set 3, dynamic offset). */
+    { HLE_QUIRK_NO_PUSH_CONST, "no_push_const", mesa_turnip },
 };
 
 static uint32_t g_defaults;
@@ -266,6 +274,8 @@ static void set(uint32_t mask, const char *why)
             why ? why : "");
 }
 
+static char g_driver_line[384];
+
 void hle_quirks_init(VkPhysicalDevice phys)
 {
     HleDriver d = { .drv = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES } };
@@ -279,10 +289,32 @@ void hle_quirks_init(VkPhysicalDevice phys)
             g_defaults |= k_quirks[i].bit;
         }
     }
-    hle_log("hakuX-hle-back", "vk: driver \"%s\" (id %u) %s", d.drv.driverName, d.drv.driverID,
-            d.drv.driverInfo);
+    snprintf(g_driver_line, sizeof(g_driver_line), "\"%s\" (id %u) %s",
+             d.drv.driverName, d.drv.driverID, d.drv.driverInfo);
+    hle_log("hakuX-hle-back", "vk: driver %s", g_driver_line);
     const char *e = getenv("HAKUX_HLE_QUIRKS");
     set(apply(g_defaults, e), e ? "HAKUX_HLE_QUIRKS" : NULL);
+}
+
+size_t hle_quirks_summary(char *buf, size_t len)
+{
+    if (!buf || !len) {
+        return 0;
+    }
+    if (!g_driver_line[0]) {
+        buf[0] = 0;
+        return 0;
+    }
+    char on[256], def[256];
+    names(g_hle_quirks, on, sizeof(on));
+    names(g_defaults, def, sizeof(def));
+    int n = snprintf(buf, len, "vk_driver: %s\nvk_quirks: %s (defaults: %s)\n",
+                     g_driver_line, on, def);
+    if (n < 0) {
+        buf[0] = 0;
+        return 0;
+    }
+    return (size_t)n < len ? (size_t)n : len - 1;
 }
 
 void hle_quirks_poll(void)

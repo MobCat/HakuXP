@@ -46,6 +46,8 @@ typedef struct HleXbeInfo {
     bool     debug_keys;
     bool     plain_entry;    /* stored unencoded (guest-memory header) */
     uint32_t title_id;
+    uint32_t game_region;    /* certificate: 1 NA, 2 Japan, 4 rest of world */
+    uint32_t version;        /* certificate */
     unsigned nsections;
     HleXbeSection sections[HLE_XBE_MAX_SECTIONS];
     unsigned nlibs;
@@ -66,6 +68,12 @@ int hle_xbe_parse(const uint8_t *hdr, uint32_t hdr_len, HleXbeInfo *out);
 const HleXbeSection *hle_xbe_find_section(const HleXbeInfo *x,
                                           const char *name);
 const HleXbeLib *hle_xbe_find_lib(const HleXbeInfo *x, const char *name);
+/* The disc's XMID ("MS04204A": publisher, game number, version, region) and
+ * serial ("MS-042"), as the owner's XBELib (XBEJson.go) derives them from the
+ * certificate, so logs match the ROM database. out holds HLE_XBE_ID_MAX. */
+#define HLE_XBE_ID_MAX 16
+void hle_xbe_xmid(const HleXbeInfo *x, char out[HLE_XBE_ID_MAX]);
+void hle_xbe_serial(const HleXbeInfo *x, char out[HLE_XBE_ID_MAX]);
 /* The title's D3D library: D3D8, or D3D8LTCG for link-time-compiled titles
  * (the same device structure per build). */
 const HleXbeLib *hle_xbe_d3d_lib(const HleXbeInfo *x);

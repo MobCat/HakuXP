@@ -230,10 +230,19 @@ static const char *k_cmp[8] = {
 
 /* Shadow buffer at stage s: the stored depth compared with the r coordinate
  * (depth FUNC r, both in the format's range; PROJECT2D compares with 0),
- * the four results bilinearly weighted (percentage-closer filtering). */
+ * the four results bilinearly weighted (percentage-closer filtering). The
+ * range is the format's D3D maximum, the one a float target's image is
+ * stored over (pbdraw.c zfloat_scale): F24 1e30, F16 511.9375. F24 read at
+ * F16's left every stored depth near 0 and r clamped to 511.9375, so the
+ * compare passed across the whole map (TransWorld Snowboarding's three
+ * stadium-light shadows were dark squares, not the rider).
+ * F24's r is its own r / q: nvproj keeps coordinates within 1e7 (a guard for
+ * sampling), far below F24's depths (TWS's rider ~3e28), and at the right
+ * range the compare then failed everywhere (no shadow at all). D24's range
+ * passes 1e7 too (16777215); its r is left as it was, untested. */
 static void shadow_sample(Buf *b, const HlePshKey *k, unsigned s, bool project3d)
 {
-    static const char *const k_max[4] = { "1.0", "16777215.0", "65535.0", "511.9375" };
+    static const char *const k_max[4] = { "1.0e30", "16777215.0", "65535.0", "511.9375" };
     static const char *const k_op[8] = { "", "lessThan", "equal", "lessThanEqual", "greaterThan",
                                          "notEqual", "greaterThanEqual", "" };
     unsigned func = (k->shadow >> 4) & 7, fmt = (k->shadow_fmt >> (2 * s)) & 3;
@@ -241,7 +250,10 @@ static void shadow_sample(Buf *b, const HlePshKey *k, unsigned s, bool project3d
         put(b, "  vec4 t%u = vec4(%s);\n", s, func ? "1.0" : "0.0");
         return;
     }
-    const char *r = project3d ? "clamp(pq.z, 0.0, m)" : "0.0";
+    char rf24[128];
+    snprintf(rf24, sizeof(rf24), "clamp(abs(vTex%u.w) > 1.0e-30 ? vTex%u.z / vTex%u.w : "
+             "vTex%u.z * 3.0e38, 0.0, m)", s, s, s, s);
+    const char *r = !project3d ? "0.0" : fmt == 0 ? rf24 : "clamp(pq.z, 0.0, m)";
     put(b, "  vec4 t%u;\n  { uint ti = pc.tex[%u] & 0xFFFFu, si = pc.tex[%u] >> 16;\n"
            "    vec3 pq = nvproj(vTex%u);\n"
            "    vec2 uv = pq.xy;\n"

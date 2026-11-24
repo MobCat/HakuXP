@@ -35,6 +35,29 @@ void hle_pb_pushed(uint32_t put);
 /* The guest wrote DMA_GET, the channel's or CACHE1's (a reset, a channel
  * set-up): the scout syncs again. */
 void hle_pb_get(void);
+/* Playbooks (native/dev/inputsync.h): the scout counts the frames the title
+ * pushes (FLIP_INCREMENT_WRITE) at every PUT while on; frames_pushed reads
+ * the count, on the guest's thread only (false: off, or not push-buffer
+ * mode). Pushes the scout missed (a GET written, the stream lost) aren't
+ * counted. */
+void hle_pb_count_frames(bool on);
+/* Playbooks (native/kernel/detevents.h): the decoder has done what the
+ * guest pushed, or waits on the guest itself (a trap, a flip stall, the
+ * FIFO off): nothing more comes from it until the guest acts. Any thread. */
+bool hle_pb_quiescent(void);
+/* Playbooks (native/kernel/detevents.h): the GPU in lockstep with the
+ * guest. The guest's writes that let the decoder go on (a PUT, PGRAPH's FIFO,
+ * its interrupt cleared, a flip) wait in hle_pb_settle until it has done
+ * what they allow and stopped (quiescent): what the GPU does, its traps and
+ * D3D's callbacks, then reaches the guest at the same instruction every
+ * run, not after however much it ran meanwhile. Soulcalibur II stirs its
+ * random numbers while it waits for the GPU's callback (2026-11-17). */
+void hle_pb_lockstep(bool on);
+bool hle_pb_lockstep_on(void);
+void hle_pb_settle(void);
+/* debug: the decoder's state for that, as text */
+void hle_pb_quiescent_why(char *buf, size_t n);
+bool hle_pb_frames_pushed(uint32_t *n);
 /* The guest wrote PCRTC_START: the display shows the memory at pa (any
  * thread; the decode thread presents it). */
 void hle_pb_display_start(uint32_t pa);

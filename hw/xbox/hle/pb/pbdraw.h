@@ -38,6 +38,9 @@ void hle_pbd_overlay(bool show);
 void hle_pbd_skip_reasons(char *buf, size_t len);
 /* debug: overlay updates sent to the back end */
 uint64_t hle_pbd_overlays(void);
+/* The last swap id the decoder gave out (any thread): the frames the title
+ * has swapped so far, as the display's swap ids count them. */
+uint32_t hle_pbd_swap_id(void);
 /* PCRTC_START writes that named the object shown, unchanged (not presented) */
 uint64_t hle_pbd_display_repeats(void);
 /* program draws that reused the last draw's constant block */

@@ -109,6 +109,25 @@ void hle_hitch_frame(uint32_t id, int stage);
 void hle_hitch_gpu_done(void);
 /* overlay text (lines separated by '\n'); false = nothing to show */
 bool hle_hitch_overlay(char *buf, size_t n);
+/* The overlay's last hang and last stutter older than this many seconds
+ * show "--" for their age instead of a counter going up (0: always the
+ * age). The log keeps their times either way. Any thread. */
+void hle_hitch_set_age_limit(int seconds);
+/* Special values returned in *pace by hle_hitch_pace() alongside whole
+ * vblank divisors (1..4 = 60/30/20/15 fps on 60 Hz; 50/25/17/12.5 on 50 Hz):
+ *   HLE_PACE_UNKNOWN (0): too few frames seen yet (overlay shows "--")
+ *   HLE_PACE_NONE   (-1): title explicitly requests no cap (IMMEDIATE)
+ *   HLE_PACE_NA     (-2): no valid target (emu uncap active, or missing/broken) */
+enum {
+    HLE_PACE_UNKNOWN = 0,
+    HLE_PACE_NONE = -1,
+    HLE_PACE_NA = -2,
+};
+
+/* The title's pace, what frames are held to (any thread): *pace in 1..4
+ * (whole vblanks), HLE_PACE_NONE, or HLE_PACE_NA; *hz is the mode's vblank
+ * rate. false while too few frames are known (or the monitor is off). */
+bool hle_hitch_pace(int *pace, float *hz);
 
 /* The vCPU's PC for the samplers (stalls here, the perf capture in hle.c),
  * from a front end whose vCPU state is not first_cpu's env (the native core:

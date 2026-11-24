@@ -3,6 +3,7 @@
  */
 #include "hw/xbox/hle/base.h"
 #include "hw/xbox/hle/hle.h"
+#include "hw/xbox/hle/host.h"
 #include "hw/xbox/hle/pb/pbmode.h"
 #include "hw/xbox/hle/prop.h"
 #include "hw/xbox/hle/hitch.h"
@@ -26,7 +27,9 @@ void hle_log(const char *tag, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-#ifdef __ANDROID__
+#if defined(HAKUX_NATIVE_CORE)
+    hle_host_log(tag, buf);
+#elif defined(__ANDROID__)
     __android_log_print(ANDROID_LOG_INFO, tag, "%s", buf);
 #else
     fprintf(stderr, "%s: %s\n", tag, buf);

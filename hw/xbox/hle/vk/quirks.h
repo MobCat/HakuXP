@@ -96,6 +96,14 @@ enum {
      * Arm's driver before r40, whose r34p0 lost the device this way on a
      * Mali-G52 (mid-game, across titles) and on a Mali-G57 (JSRF). */
     HLE_QUIRK_NO_SEM_WAIT = 1u << 14,
+    /* Back-to-back draws that update push constants without an intervening
+     * flush can read a neighbouring draw's push block (Turnip on Adreno 740,
+     * 26.3.0-devel: Serious Sam's crosshair rendered the next HUD draw's
+     * texture for a frame; TU_DEBUG=flushall, -bindless and -push each
+     * eliminated it): the draw's push block goes in a per-draw dynamic
+     * storage buffer ring instead (vk/draw.c g_hle_push_ssbo). Read when
+     * the back end starts: it changes the shaders and pipeline layout. */
+    HLE_QUIRK_NO_PUSH_CONST = 1u << 15,
 };
 
 extern uint32_t g_hle_quirks;
@@ -110,5 +118,8 @@ void hle_quirks_init(VkPhysicalDevice phys);
 
 /* Once a frame: debug.hakux.quirks changed. */
 void hle_quirks_poll(void);
+
+/* Formats the Vulkan driver identity and active quirks into buf (crash reports). */
+size_t hle_quirks_summary(char *buf, size_t len);
 
 #endif

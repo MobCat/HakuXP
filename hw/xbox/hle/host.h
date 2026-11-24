@@ -13,6 +13,10 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Host logging sink; the native core fans this out to platform logs and its
+ * optional debug service. The renderer does not know the wire protocol. */
+void hle_host_log(const char *tag, const char *text);
+
 /* ---- the guest CPU ------------------------------------------------------- */
 
 /* x86 general registers, in their encoding order. */

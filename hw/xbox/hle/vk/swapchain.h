@@ -36,5 +36,10 @@ bool hle_present_frame(uint32_t *w, uint32_t *h);
  * false samples a frame larger than its place bilinearly too (comparisons).
  * key: what hle_present_unchanged compares next. */
 void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, uint64_t key);
+/* A number for hle_present_end to stamp in the window's top right corner, in
+ * hex 7-segment digits (util/stamp.h), white on black; on false: none. The
+ * host's number (the native core: its emulation count, as its log lines
+ * start with). A frame left unchanged keeps the stamp it was presented with. */
+void hle_present_stamp(bool on, uint64_t value);
 
 #endif

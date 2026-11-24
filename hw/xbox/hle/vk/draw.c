@@ -472,9 +472,14 @@ static bool push_ring_init(void)
         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
         .pBufferInfo = &bi };
     T.vkUpdateDescriptorSets(g_hvk.dev, 1, &w, 0, NULL);
-    hle_log("hakuX-hle-back", "push constants %u bytes < %u: the draws' block in a storage "
-            "buffer (%u KiB a command buffer)", g_hvk.props.limits.maxPushConstantsSize,
-            HLE_PUSH_BYTES, PUSH_PART_BYTES >> 10);
+    if (g_hvk.caps.push) {
+        hle_log("hakuX-hle-back", "push constants avoided: the draws' block in a storage "
+                "buffer (%u KiB a command buffer)", PUSH_PART_BYTES >> 10);
+    } else {
+        hle_log("hakuX-hle-back", "push constants %u bytes < %u: the draws' block in a storage "
+                "buffer (%u KiB a command buffer)", g_hvk.props.limits.maxPushConstantsSize,
+                HLE_PUSH_BYTES, PUSH_PART_BYTES >> 10);
+    }
     return g_dr.pmap != NULL;
 }
 
@@ -710,7 +715,8 @@ int hle_draw_init(void)
                       offsetof(HleFfPush, fog) != 128 || offsetof(HleFfPush, bump) != 240 ||
                       sizeof(HleFfPush) != 256);
     HLE_BUILD_BUG_ON(sizeof(HleFfPush) != HLE_PUSH_BYTES);
-    g_hle_push_ssbo = !g_hvk.caps.push;     /* before any shader is made */
+    /* before any shader is made */
+    g_hle_push_ssbo = !g_hvk.caps.push || hle_quirk(HLE_QUIRK_NO_PUSH_CONST);
     g_hle_glsl_zw = hle_quirk(HLE_QUIRK_Z_EQ_W);
     g_hle_glsl_zclamp = !g_hvk.caps.depth_clamp;
     g_hle_glsl_fixed = !g_hvk.caps.bindless;
@@ -1145,18 +1151,20 @@ static HleVkSurf *tex_surface(uint32_t id, uint32_t rt_id)
 }
 
 /* Shadow-buffer depth range of the stage's texture (HlePshKey.shadow_fmt):
- * 0 not a depth surface. */
-static unsigned shadow_fmt(uint32_t id)
+ * 0 F24, 1 D24, 2 D16, 3 F16; -1 not a depth surface. F24 and F16 were one
+ * code (3, F16's range) before; F24 took the free 0 so that no other key
+ * changed (the pipeline caches keep them). */
+static int shadow_fmt(uint32_t id)
 {
     HleVkSurf *s = id && !tex_find(id) ? hle_surf_get(id) : NULL;
     if (!s || !s->img || (s->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
-        return 0;
+        return -1;
     }
     switch (s->d.xfmt) {
-    case HLE_XFMT_D16: case HLE_XFMT_LIN_D16:   return 2;
-    case HLE_XFMT_F24S8: case HLE_XFMT_LIN_F24S8:
-    case HLE_XFMT_F16: case HLE_XFMT_LIN_F16:   return 3;
-    default:                                    return 1;
+    case HLE_XFMT_F24S8: case HLE_XFMT_LIN_F24S8:   return 0;
+    case HLE_XFMT_D16: case HLE_XFMT_LIN_D16:       return 2;
+    case HLE_XFMT_F16: case HLE_XFMT_LIN_F16:       return 3;
+    default:                                        return 1;
     }
 }
 
@@ -3464,7 +3472,7 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         fs->resultarg = t[TSS_RESULTARG];
         uint32_t lin = 0;
         /* fixed-function shadow buffers: not yet (white, as before) */
-        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin);
+        uint32_t slot = shadow_fmt(c->tex[st]) >= 0 ? 0 : stage_slot(c, st, rt_id, &lin);
         pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8);
         fs->texture = c->tex[st] != 0;
         fs->unset = c->tex_unset >> st & 1;
@@ -3501,10 +3509,10 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             k.pk.alpha_kill |= (c->tex[st] && s->tss[st][TSS_ALPHAKILL] != 0) << st;
         }
         for (unsigned st = 0; st < 4; st++) {
-            unsigned sf = shadow_fmt(c->tex[st]);
-            if (sf) {
+            int sf = shadow_fmt(c->tex[st]);
+            if (sf >= 0) {
                 k.pk.shadow |= 1u << st;
-                k.pk.shadow_fmt |= sf << (2 * st);
+                k.pk.shadow_fmt |= (uint8_t)(sf << (2 * st));
             }
         }
         for (unsigned st = 0; st < 4; st++) {

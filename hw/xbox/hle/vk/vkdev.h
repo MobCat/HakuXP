@@ -137,5 +137,7 @@ void hle_vk_queue_unlock(void);
 int64_t hle_vk_queue_wait_ns(void);
 int hle_vk_memtype(uint32_t bits, VkMemoryPropertyFlags want,
                    VkMemoryPropertyFlags avoid);
+/* Formats the Vulkan device, capabilities, driver and quirks into buf (crash reports). */
+size_t hle_vk_summary(char *buf, size_t len);
 
 #endif

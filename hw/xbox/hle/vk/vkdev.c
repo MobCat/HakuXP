@@ -727,3 +727,39 @@ int hle_vk_init(void)
     return 0;
 }
 
+size_t hle_vk_summary(char *buf, size_t len)
+{
+    if (!buf || !len) {
+        return 0;
+    }
+    const HleVk *v = &g_hvk;
+    if (!v->props.deviceName[0]) {
+        buf[0] = 0;
+        return 0;
+    }
+    const HleCaps *c = &v->caps;
+    int n = snprintf(buf, len,
+                     "vk_device: \"%s\" vendor=0x%04x device=0x%04x api=%u.%u.%u driver=0x%x floor=%s\n"
+                     "vk_caps_plus: gpl=%d eds3=%d dbuf=%d m5=%d sscaled=%d local_read=%d fbfetch=%d cache_control=%d swapchain=%d\n"
+                     "vk_caps_core: bc=%d vids=%d push=%d push_desc=%d cbc=%d cbc_any=%d x4444=%d d24s8=%d bda=%d ahb=%d vk13=%d dyn_render=%d sync2=%d eds1=%d eds2=%d bindless=%d depth_clamp=%d\n",
+                     v->props.deviceName, v->props.vendorID, v->props.deviceID,
+                     VK_API_VERSION_MAJOR(v->props.apiVersion),
+                     VK_API_VERSION_MINOR(v->props.apiVersion),
+                     VK_API_VERSION_PATCH(v->props.apiVersion),
+                     v->props.driverVersion, c->floor_ok ? "ok" : (c->missing[0] ? c->missing : "missing"),
+                     c->gpl, c->eds3, c->descriptor_buffer, c->maint5, c->sscaled,
+                     c->local_read, c->fbfetch, c->cache_control, c->swapchain,
+                     c->bc, c->vids, c->push, c->push_desc, c->cbc, c->cbc_any,
+                     c->x4444, c->d24s8, c->bda, c->ahb, c->vk13, c->dyn_render,
+                     c->sync2, c->eds1, c->eds2, c->bindless, c->depth_clamp);
+    if (n < 0) {
+        buf[0] = 0;
+        return 0;
+    }
+    size_t pos = (size_t)n < len ? (size_t)n : len - 1;
+    if (pos + 1 < len) {
+        pos += hle_quirks_summary(buf + pos, len - pos);
+    }
+    return pos;
+}
+

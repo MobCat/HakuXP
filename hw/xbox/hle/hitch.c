@@ -12,7 +12,9 @@
 #include "hw/xbox/hle/hle.h"
 #include "hw/xbox/hle/hitch.h"
 #include "hw/xbox/hle/host.h"
+#include "hw/xbox/hle/prop.h"
 #include "hw/xbox/hle/pb/pbdraw.h"
+#include "hw/xbox/hle/util/age.h"
 #include "hw/xbox/hle/vk/back.h"
 
 HleHitchThr g_hitch_thr[HLE_HT_N];
@@ -44,6 +46,7 @@ typedef struct Eip {
 
 typedef struct Last {
     bool valid;
+    unsigned no;            /* its number, as the log line has it: "stutter #N", "HANG #N" */
     int64_t start_us;
     float ms;
     char reason[96];
@@ -97,8 +100,11 @@ static struct {
     int64_t shown_comp;                 /* the render thread's compile time then */
     uint32_t shown_gmark;               /* debug: the GPU event trace's position then */
     unsigned dropped;
-    uint8_t cad[16];                    /* recent front intervals, in vblanks */
+    uint8_t cad[16];                    /* recent front intervals, in vblanks (1..CAD_MAX_VBLANKS) */
     unsigned ncad;
+    unsigned slow_frames;               /* frames slower than CAD_MAX_VBLANKS without a valid pace */
+    int pace_state;                     /* HLE_PACE_UNKNOWN, HLE_PACE_NONE, or HLE_PACE_NA */
+    int logged_pace;                    /* last pace logged: 0 none, -1/-2 special, 1..4 vblanks */
     double last_fint;                   /* the last front interval, ms */
     unsigned gtrace_left;               /* debug: GPU event traces still to log */
 } g_h;
@@ -168,27 +174,95 @@ static float vblank_ms(void)
     return p > 0 ? p / 1e6f : 16.68f;
 }
 
+/* Valid Xbox D3D8 presentation intervals are 1..4 vblanks (60/30/20/15 fps
+ * on 60 Hz; 50/25/17/12.5 fps on 50 Hz) or IMMEDIATE (no cap: HLE_PACE_NONE).
+ * Intervals slower than 4 vblanks (e.g. 10 fps during a stall) are slowdowns,
+ * not a requested target pace, so do not train the cadence window on them. */
+#define CAD_MAX_VBLANKS 4u
+
+/* Whether the emulator's own "Uncapped frame rate" setting is active
+ * (HAKUX_HLE_UNCAP / debug.hakux.uncap): synthetic early vblanks prevent
+ * measuring the title's requested vsync target, so pace reports HLE_PACE_NA. */
+static bool emu_uncap_on(void)
+{
+    static int on = -1;
+    static unsigned polls;
+    if (on < 0) {
+        on = getenv("HAKUX_HLE_UNCAP") != NULL;
+    }
+    if (polls++ % 64 == 0) {
+        char v[PROP_VALUE_MAX] = "";
+        if (hle_prop_get("debug.hakux.uncap", v) > 0) {
+            on = atoi(v) != 0;
+        }
+    }
+    return on != 0;
+}
+
 /* The title's frame interval as the screen shows it: the median of the
  * recent front intervals in whole vblanks (a title pacing itself, such as
  * PGR2's movies at 30 fps on interval 1, is not late every frame); 0 until
- * there are enough. */
-static float cad_median(void)
+ * there are enough, or while in HLE_PACE_NONE / HLE_PACE_NA. */
+static unsigned cad_vblanks(void)
 {
-    unsigned n = MIN(g_h.ncad, (unsigned)ARRAY_SIZE(g_h.cad));
+    if (__atomic_load_n(&g_h.pace_state, __ATOMIC_ACQUIRE) != HLE_PACE_UNKNOWN) {
+        return 0;
+    }
+    unsigned n = MIN(__atomic_load_n(&g_h.ncad, __ATOMIC_ACQUIRE), (unsigned)ARRAY_SIZE(g_h.cad));
     if (n < 8) {
-        return 0.0f;
+        return 0;
     }
-    unsigned cnt[9] = { 0 }, half = n / 2, acc = 0;
+    unsigned cnt[CAD_MAX_VBLANKS + 1] = { 0 }, half = n / 2, acc = 0;
     for (unsigned i = 0; i < n; i++) {
-        cnt[MIN(g_h.cad[i], 8u)]++;
-    }
-    for (unsigned q = 1; q <= 8; q++) {
-        acc += cnt[q];
-        if (acc > half) {
-            return q * vblank_ms();
+        const unsigned v = g_h.cad[i];
+        if (v >= 1 && v <= CAD_MAX_VBLANKS) {
+            cnt[v]++;
         }
     }
-    return 0.0f;
+    for (unsigned q = 1; q <= CAD_MAX_VBLANKS; q++) {
+        acc += cnt[q];
+        if (acc > half) {
+            return q;
+        }
+    }
+    return 0;
+}
+
+/* Log the observed presentation pace when it first settles or changes
+ * (HLE_PACE_NONE, HLE_PACE_NA, or 1..CAD_MAX_VBLANKS vblanks per frame). */
+static void pace_log(int pace)
+{
+    const int prev = __atomic_exchange_n(&g_h.logged_pace, pace, __ATOMIC_ACQ_REL);
+    if (prev == pace) {
+        return;
+    }
+    const float hz = 1000.0f / vblank_ms();
+    if (pace == HLE_PACE_NONE) {
+        hle_log(TAG, "pace: none (%.0f Hz)", hz);
+    } else if (pace == HLE_PACE_NA) {
+        hle_log(TAG, "pace: n/a (%.0f Hz)", hz);
+    } else if (pace > 0) {
+        hle_log(TAG, "pace: %.0f fps (%.0f Hz, %d vblank%s)",
+                hz / (float)pace, hz, pace, pace == 1 ? "" : "s");
+    }
+}
+
+static float cad_median(void)
+{
+    return cad_vblanks() * vblank_ms();
+}
+
+bool hle_hitch_pace(int *pace, float *hz)
+{
+    *hz = 1000.0f / vblank_ms();
+    const int st = __atomic_load_n(&g_h.pace_state, __ATOMIC_ACQUIRE);
+    if (st == HLE_PACE_NONE || st == HLE_PACE_NA) {
+        *pace = st;
+        return true;
+    }
+    unsigned q = cad_vblanks();
+    *pace = (int)q;
+    return q != 0;
 }
 
 /* The frame time: there is no presentation interval to go by (the title's
@@ -309,7 +383,7 @@ static void explain(const Snap *a, const Snap *b, const Eip *e, double w, char *
     } else if (e->n >= 8 && e->host_jit * 100 >= 40u * e->n) {
         snprintf(r, rn, "JIT compiling: %u%% of the vCPU in FEX", 100 * e->host_jit / e->n);
     } else if (e0) {
-        snprintf(r, rn, "%s: %s %08x (%u%%)", is_host(e0) ? "vCPU in host code" : "guest CPU-bound",
+        snprintf(r, rn, "%s: %s code at %08X (%u%%)", is_host(e0) ? "vCPU in host code" : "guest CPU-bound",
                  region(e0), shown(e0), e->n ? 100 * c0 / e->n : 0);
     } else {
         snprintf(r, rn, "guest CPU-bound (%llu draws)", (unsigned long long)(b->draws - a->draws));
@@ -558,6 +632,19 @@ static void window(uint32_t id)
     double ms = t2ms(now.t - prev.t);
     if (measured && ms < 1000.0) {
         g_h.swap_ms = g_h.swap_ms ? 0.9f * g_h.swap_ms + 0.1f * (float)ms : (float)ms;
+        if (g_h.swaps >= 8) {
+            if (emu_uncap_on()) {
+                __atomic_store_n(&g_h.pace_state, HLE_PACE_NA, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_h.ncad, 0, __ATOMIC_RELEASE);
+                pace_log(HLE_PACE_NA);
+            } else if (g_h.swap_ms > 0.0f && g_h.swap_ms < 0.8f * vblank_ms()) {
+                __atomic_store_n(&g_h.pace_state, HLE_PACE_NONE, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_h.ncad, 0, __ATOMIC_RELEASE);
+                pace_log(HLE_PACE_NONE);
+            } else if (__atomic_load_n(&g_h.pace_state, __ATOMIC_ACQUIRE) == HLE_PACE_NONE) {
+                __atomic_store_n(&g_h.pace_state, HLE_PACE_UNKNOWN, __ATOMIC_RELEASE);
+            }
+        }
     }
     bool disp = display_active(now.us);
     if (!measured || ms < (disp ? late_ms() : stutter_ms())) {
@@ -577,6 +664,7 @@ static void window(uint32_t id)
     Last *l = hang ? &g_h.last_hang : &g_h.last_stutter;  /* (lock held) */
     unsigned no = hang ? ++g_h.hangs : ++g_h.stutters;
     l->valid = true;
+    l->no = no;
     l->start_us = prev.us;
     l->ms = ms;
     hle_strlcpy(l->reason, sizeof(l->reason), reason);
@@ -634,15 +722,45 @@ static void display_eval(uint32_t id, const FrameT *f)
         return;                         /* first, out of order, or after a pause */
     }
     float vb = vblank_ms();
+    if (emu_uncap_on()) {
+        __atomic_store_n(&g_h.pace_state, HLE_PACE_NA, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_h.ncad, 0, __ATOMIC_RELEASE);
+        if (g_h.swaps >= 8) {
+            pace_log(HLE_PACE_NA);
+        }
+        return;     /* emulator uncap active: synthetic early vblanks */
+    }
     if (g_h.swap_ms && g_h.swap_ms < 0.8f * vb) {
-        return;     /* IMMEDIATE (or uncapped): frames outrun the UI by design */
+        __atomic_store_n(&g_h.pace_state, HLE_PACE_NONE, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_h.ncad, 0, __ATOMIC_RELEASE);
+        if (g_h.swaps >= 8) {
+            pace_log(HLE_PACE_NONE);
+        }
+        return;     /* IMMEDIATE (no cap): frames outrun the UI by design */
+    }
+    if (__atomic_load_n(&g_h.pace_state, __ATOMIC_ACQUIRE) == HLE_PACE_NONE) {
+        __atomic_store_n(&g_h.pace_state, HLE_PACE_UNKNOWN, __ATOMIC_RELEASE);
     }
     float exp = expected_ms();
     unsigned skipped = id - pid - 1;
     double fint = (g_h.shown_front - pfront) / 1000.0;
     bool late = fint >= late_ms();
     if (!skipped) {                     /* the cadence: whole vblanks between fronts */
-        g_h.cad[g_h.ncad++ % ARRAY_SIZE(g_h.cad)] = (uint8_t)MIN(MAX(fint / vb + 0.5, 1.0), 8.0);
+        const unsigned q = (unsigned)MAX(fint / vb + 0.5, 1.0);
+        if (q <= CAD_MAX_VBLANKS) {
+            g_h.slow_frames = 0;
+            __atomic_store_n(&g_h.pace_state, HLE_PACE_UNKNOWN, __ATOMIC_RELEASE);
+            const unsigned idx = __atomic_load_n(&g_h.ncad, __ATOMIC_RELAXED);
+            g_h.cad[idx % ARRAY_SIZE(g_h.cad)] = (uint8_t)q;
+            __atomic_store_n(&g_h.ncad, idx + 1, __ATOMIC_RELEASE);
+            const unsigned med_q = cad_vblanks();
+            if (med_q) {
+                pace_log((int)med_q);
+            }
+        } else if (!cad_vblanks() && ++g_h.slow_frames >= 8) {
+            __atomic_store_n(&g_h.pace_state, HLE_PACE_NA, __ATOMIC_RELEASE);
+            pace_log(HLE_PACE_NA);
+        }
     }
     const double pfint = g_h.last_fint;
     g_h.last_fint = fint;
@@ -744,6 +862,7 @@ static void display_eval(uint32_t id, const FrameT *f)
     unsigned no = ++g_h.stutters;
     Last *l = &g_h.last_stutter;
     l->valid = true;
+    l->no = no;
     l->start_us = pfront;
     l->ms = fint;
     hle_strlcpy(l->reason, sizeof(l->reason), reason);
@@ -786,16 +905,17 @@ void hle_hitch_frame(uint32_t id, int stage)
 
 /* ---- overlay ------------------------------------------------------------------- */
 
+static int g_age_limit_s;   /* hle_hitch_set_age_limit; 0: none */
+
+void hle_hitch_set_age_limit(int seconds)
+{
+    __atomic_store_n(&g_age_limit_s, seconds > 0 ? seconds : 0, __ATOMIC_RELAXED);
+}
+
+/* "22s ago", or "--" past the age limit (nothing to watch counting up) */
 static void ago(char *b, size_t n, int64_t us)
 {
-    int64_t s = us / 1000000;
-    if (s < 60) {
-        snprintf(b, n, "%llds", (long long)s);
-    } else if (s < 3600) {
-        snprintf(b, n, "%lldm%02llds", (long long)(s / 60), (long long)(s % 60));
-    } else {
-        snprintf(b, n, "%lldh%02lldm", (long long)(s / 3600), (long long)(s / 60 % 60));
-    }
+    hle_age_text(b, n, us, __atomic_load_n(&g_age_limit_s, __ATOMIC_RELAXED));
 }
 
 bool hle_hitch_overlay(char *buf, size_t n)
@@ -807,20 +927,23 @@ bool hle_hitch_overlay(char *buf, size_t n)
     char a[24];
     size_t o = 0;
     hle_mutex_lock(&g_h.mx);
-    o += snprintf(buf + o, n - o, "stutters %u  |  hangs %u  |  dropped %u", g_h.stutters,
+    /* Short lines near the picture's edge, no reasons: the number finds the
+     * full line in the log ("stutter #N", "HANG #N"), and so does the
+     * emulation count stamped in the frame's corner. */
+    o += snprintf(buf + o, n - o, "stutters %u | hangs %u | dropped %u", g_h.stutters,
                   g_h.hangs, g_h.dropped);
     if (g_h.live && o < n) {
         double el = t2ms(hle_prof_now() - g_h.win.t) / 1000.0;
-        o += snprintf(buf + o, n - o, "\nHANG NOW %.1fs: %s", el, g_h.live_reason);
+        o += snprintf(buf + o, n - o, "\nHANG NOW: %.1f s", el);
     } else if (g_h.last_hang.valid && o < n) {
         ago(a, sizeof(a), now - g_h.last_hang.start_us);
-        o += snprintf(buf + o, n - o, "\nlast hang %.2fs, %s ago: %s", g_h.last_hang.ms / 1000.0,
-                      a, g_h.last_hang.reason);
+        o += snprintf(buf + o, n - o, "\nlast hang #%u: %.2f s, %s", g_h.last_hang.no,
+                      g_h.last_hang.ms / 1000.0, a);
     }
     if (g_h.last_stutter.valid && o < n) {
         ago(a, sizeof(a), now - g_h.last_stutter.start_us);
-        o += snprintf(buf + o, n - o, "\nlast stutter %.0fms, %s ago: %s", g_h.last_stutter.ms,
-                      a, g_h.last_stutter.reason);
+        o += snprintf(buf + o, n - o, "\nlast stutter #%u: %.0f ms, %s", g_h.last_stutter.no,
+                      g_h.last_stutter.ms, a);
     }
     hle_mutex_unlock(&g_h.mx);
     return true;

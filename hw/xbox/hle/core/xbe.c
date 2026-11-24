@@ -3,6 +3,8 @@
  */
 #include "hw/xbox/hle/core/xbe.h"
 
+#include <stdio.h>
+
 /* Header field offsets (xemu-xbe.h struct xbe_header, packed). */
 #define XO_MAGIC            0x000
 #define XO_BASE             0x104
@@ -21,6 +23,8 @@
 #define SEC_HDR_SIZE        56
 #define LIB_SIZE            16
 #define CERT_TITLE_ID       0x08
+#define CERT_GAME_REGION    0xA0
+#define CERT_VERSION        0xAC
 
 /* Maps header VA range [va, va+len) to an offset in hdr[]. */
 static bool hva(uint32_t base, uint32_t hdr_len, uint32_t va, uint32_t len,
@@ -88,6 +92,10 @@ int hle_xbe_parse(const uint8_t *hdr, uint32_t hdr_len, HleXbeInfo *out)
     if (hva(out->base, hdr_len, cert, CERT_TITLE_ID + 4, &off)) {
         out->title_id = hle_rd32(hdr + off + CERT_TITLE_ID);
     }
+    if (hva(out->base, hdr_len, cert, CERT_VERSION + 4, &off)) {
+        out->game_region = hle_rd32(hdr + off + CERT_GAME_REGION);
+        out->version = hle_rd32(hdr + off + CERT_VERSION);
+    }
 
     uint32_t nsec = hle_rd32(hdr + XO_NSECTIONS);
     uint32_t sec_addr = hle_rd32(hdr + XO_SECTIONS_ADDR);
@@ -150,6 +158,49 @@ const HleXbeLib *hle_xbe_find_lib(const HleXbeInfo *x, const char *name)
         }
     }
     return NULL;
+}
+
+/* The title ID's publisher letters (its high half as two ASCII characters:
+ * 4D53 "MS"). XBELib copies the bytes whatever they are; a non-printable one
+ * (homebrew such as FFFF) shows as the half's hex instead. */
+static void publisher(uint32_t title_id, char out[5])
+{
+    const unsigned a = title_id >> 24, b = (title_id >> 16) & 0xFF;
+    if (a >= 0x20 && a < 0x7F && b >= 0x20 && b < 0x7F) {
+        out[0] = (char)a;
+        out[1] = (char)b;
+        out[2] = 0;
+    } else {
+        snprintf(out, 5, "%04X", title_id >> 16);
+    }
+}
+
+void hle_xbe_xmid(const HleXbeInfo *x, char out[HLE_XBE_ID_MAX])
+{
+    /* XBELib's XMIDregionDecode: the region value as a whole, no other
+     * combination (6 is no valid set; anything else has no letter). */
+    const char *region = "";
+    switch (x->game_region) {
+    case 0x1: region = "A"; break;
+    case 0x2: region = "J"; break;
+    case 0x3: region = "K"; break;
+    case 0x4: region = "E"; break;
+    case 0x5: region = "L"; break;
+    case 0x7: region = "W"; break;
+    case 0x80000000u: region = "D"; break;
+    }
+    char pub[5];
+    publisher(x->title_id, pub);
+    /* the game number: the low half in decimal; the version: its low byte */
+    snprintf(out, HLE_XBE_ID_MAX, "%s%03u%02u%s", pub, (unsigned)(x->title_id & 0xFFFF),
+             (unsigned)(x->version & 0xFF), region);
+}
+
+void hle_xbe_serial(const HleXbeInfo *x, char out[HLE_XBE_ID_MAX])
+{
+    char pub[5];
+    publisher(x->title_id, pub);
+    snprintf(out, HLE_XBE_ID_MAX, "%s-%03u", pub, (unsigned)(x->title_id & 0xFFFF));
 }
 
 const HleXbeLib *hle_xbe_d3d_lib(const HleXbeInfo *x)

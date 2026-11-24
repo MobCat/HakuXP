@@ -15,6 +15,7 @@
 #include "hw/xbox/hle/vk/guest_ram.h"
 #include "hw/xbox/hle/vk/quirks.h"
 #include "hw/xbox/hle/pb/pbres.h"
+#include "hw/xbox/hle/pb/pbslot.h"
 #include "hw/xbox/hle/tex/xdk.h"
 #include "hw/xbox/hle/tex/xdk_res.h"
 #include "hw/xbox/hle/tex/xg_swizzle.h"
@@ -116,6 +117,8 @@ typedef struct PbObj {
     HleSurfDesc d;
     uint64_t bound;                     /* when last bound as a target (g_pd.binds) */
     bool cube;                          /* a cube texture's image, its faces' targets views */
+    uint64_t sampled_bind;              /* a cube: g_pd.binds when last sampled (cube_used) */
+    uint64_t sampled_epoch;             /* ... and the epoch then (its draw may hold its id) */
     uint64_t written;                   /* g_pd.wseq at its last draw, clear or copy */
     uint64_t edge_hash[2];              /* its bytes on its first and last page (rt_cpu_sync) */
     bool cpu_used;                      /* the CPU wrote its memory (writeback) */
@@ -169,6 +172,8 @@ static struct {
     PbObj objs[MAX_OBJS];
     unsigned nobjs;
     uint32_t made;                      /* the object last made (evict_slot) */
+    uint32_t keep;                      /* the colour target a bind has while it makes its depth
+                                           one (evict_slot) */
     uint64_t binds;                     /* targets bound (PbObj.bound's clock) */
     /* colour textures over a depth buffer's memory: their images, converted
      * from the depth image (HLE_OP_ZREAD) at each use, or the CPU's bytes
@@ -210,6 +215,9 @@ static struct {
     uint32_t pend[8];
     bool pend_flipped[8];
     uint32_t pend_head, pend_tail;
+    /* recent swaps' timeline values (swap_pace: matches HLE_FRAMES = 3) */
+    uint64_t swap_vals[3];
+    uint32_t swap_vpos;
     /* D3D's immediate flip (its trap's handler, before the frame's
      * FLIP_INCREMENT_WRITE): ahead_pa, the bound target's memory while it
      * has a frame drawn since the last swap (set at each trap, atomic);
@@ -396,6 +404,11 @@ void hle_pbd_stop(void)
 uint64_t hle_pbd_overlays(void)
 {
     return g_pd.overlays;
+}
+
+uint32_t hle_pbd_swap_id(void)
+{
+    return __atomic_load_n(&g_pd.swap_ids, __ATOMIC_RELAXED);
 }
 
 uint64_t hle_pbd_display_repeats(void)
@@ -628,26 +641,100 @@ static void restored_pixels(PbObj *o)
     }
 }
 
-/* The slot a new object takes once all are used: the one bound longest ago
- * (never bound first), and never one still in use: the bound targets, the
- * one shown, a cube or its faces (views into it), a z-read's source, the
- * one just made (a bind makes its colour target, then its depth one).
- * NULL if every one is. */
-static PbObj *evict_slot(void)
+static PbObj *obj_of(uint32_t id);
+
+/* The object a new one replaces once all slots are used (pb/pbslot.c): the
+ * one used longest ago (never bound first), a cube with its faces' views as
+ * one (used when bound or sampled), and never one in use: the bound targets,
+ * the one shown, the one just made, the colour target a bind has while it
+ * makes its depth one (keep), a z-read's source, a cube sampled this epoch
+ * (the draw being built may hold its id), objects over [keep_pa, keep_pa +
+ * keep_len) (a cube's faces as it is made). NULL if every one is. Cubes were
+ * never chosen: RalliSport Challenge 2 makes one per stage at a new address,
+ * the table filled with them, and from the seventh stage no cube could be
+ * made, the cars' reflection sampled as face 0's 2D image (white cars). */
+static PbObj *evict_slot(uint32_t keep_pa, uint32_t keep_len)
 {
-    PbObj *best = NULL;
+    HlePbSlot s[MAX_OBJS];
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
-        PbObj *o = &g_pd.objs[i];
+        const PbObj *o = &g_pd.objs[i];
         bool busy = o->id == g_pd.rt || o->id == g_pd.ds || o->id == g_pd.shown_id ||
-                    o->id == g_pd.made || o->cube || o->d.parent;
+                    o->id == g_pd.made || o->id == g_pd.keep ||
+                    (o->cube && o->sampled_epoch == g_pd.epoch) ||
+                    (keep_len && o->d.pa - keep_pa < keep_len);
         for (unsigned j = 0; j < g_pd.nzr && !busy; j++) {
             busy = g_pd.zr[j].src == o->id;
         }
-        if (!busy && (!best || o->bound < best->bound)) {
-            best = o;
+        s[i] = (HlePbSlot){ .id = o->id, .parent = o->d.parent, .cube = o->cube, .busy = busy,
+                            .used = o->cube ? o->sampled_bind : o->bound };
+    }
+    return obj_of(hle_pb_slot_victim(s, g_pd.nobjs));
+}
+
+/* Object i goes: its image, and its slot, the table closed up over it. */
+static void obj_drop(unsigned i)
+{
+    PbObj *o = &g_pd.objs[i];
+    coh_forget(o);                          /* (another over its memory keeps it guarded) */
+    HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
+    x->after = 0;
+    x->id = o->id;
+    hle_fe_commit();
+    memmove(o, o + 1, (g_pd.nobjs - i - 1) * sizeof(*o));
+    g_pd.nobjs--;
+}
+
+/* A cube evict_slot chose goes with its faces' views, views first. The
+ * table closes up: pointers into it are looked up again (rt_obj, ds_obj;
+ * callers holding one look theirs up by id). The faces' memory is plain
+ * memory again: a target bound there is a new object, a cube sampled there
+ * a new cube. */
+static void cube_free(uint32_t cube)
+{
+    uint32_t pa = 0;
+    unsigned views = 0;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        for (unsigned i = 0; i < g_pd.nobjs;) {
+            const PbObj *o = &g_pd.objs[i];
+            if (pass ? o->id != cube : o->d.parent != cube) {
+                i++;
+                continue;
+            }
+            pa = o->d.pa;
+            views += !pass;
+            obj_drop(i);
         }
     }
-    return best;
+    g_pd.rt_obj = obj_of(g_pd.rt);
+    g_pd.ds_obj = obj_of(g_pd.ds);
+    static unsigned s_logged;
+    if (s_logged++ < 32) {
+        hle_log("hakuX-hle-pb", "cube %u at %08x and its %u face views freed: used longest ago (first 32 "
+                "logged)", cube, pa, views);
+    }
+}
+
+/* A slot for a new object: the next unused one, else the one evict_slot
+ * frees (keep_pa, keep_len: as there). NULL if every one is in use. */
+static PbObj *new_slot(uint32_t keep_pa, uint32_t keep_len)
+{
+    if (g_pd.nobjs < MAX_OBJS) {
+        return &g_pd.objs[g_pd.nobjs++];
+    }
+    PbObj *o = evict_slot(keep_pa, keep_len);
+    if (!o) {
+        return NULL;
+    }
+    if (o->cube) {
+        cube_free(o->id);
+        return &g_pd.objs[g_pd.nobjs++];
+    }
+    coh_forget(o);
+    HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
+    x->after = 0;
+    x->id = o->id;
+    hle_fe_commit();
+    return o;
 }
 
 /* The object for a surface (memory, format, pitch, size), made the first
@@ -681,23 +768,13 @@ static uint32_t object(uint32_t pa, uint32_t xfmt, uint32_t pitch, uint32_t w, u
     if (best) {
         return best;
     }
-    PbObj *o;
-    if (g_pd.nobjs < MAX_OBJS) {
-        o = &g_pd.objs[g_pd.nobjs++];
-    } else {
-        o = evict_slot();
-        if (!o) {
-            static unsigned s_full;
-            if (s_full++ < 8) {
-                hle_log("hakuX-hle-pb", "surface %08x: all %u objects in use (first 8 logged)", pa, MAX_OBJS);
-            }
-            return 0;
+    PbObj *o = new_slot(0, 0);
+    if (!o) {
+        static unsigned s_full;
+        if (s_full++ < 8) {
+            hle_log("hakuX-hle-pb", "surface %08x: all %u objects in use (first 8 logged)", pa, MAX_OBJS);
         }
-        coh_forget(o);
-        HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
-        x->after = 0;
-        x->id = o->id;
-        hle_fe_commit();
+        return 0;
     }
     memset(o, 0, sizeof(*o));
     o->id = g_pd.next_id++;
@@ -1144,9 +1221,11 @@ static void sync_rt(void)
     }
     uint32_t rt = cx_fmt ? object_view(cpa, cx_fmt, swz ? 0 : hle_kelvin_color_xfmt(cf, true),
                                        swz ? 0 : cpitch, w, h) : 0;
+    g_pd.keep = rt;                         /* a slot for the depth target isn't its */
     uint32_t ds = zx_fmt ? object_view(zpa, zx_fmt,
                                        swz ? 0 : hle_kelvin_depth_xfmt(zf == 2, zfloat, true),
                                        swz ? 0 : zpitch, w, h) : 0;
+    g_pd.keep = 0;
     g_pd.binds++;
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         if (g_pd.objs[i].id == rt || g_pd.objs[i].id == ds) {
@@ -1394,6 +1473,23 @@ static void front_stale(const PbObj *o)
 
 static void shown_part(const PbObj *o, uint32_t ax, uint32_t ay, uint32_t *w, uint32_t *h);
 
+/* Bound the decoder to ARRAY_SIZE(g_pd.swap_vals) swaps ahead of the GPU
+ * (matching HLE_FRAMES). Titles using D3DPRESENT_INTERVAL_IMMEDIATE with light
+ * frames (e.g. a clear-only movie loop) otherwise enqueue tens of thousands of
+ * swaps into the command ring while video overlays fill the upload arena,
+ * stalling the decoder for seconds at a time. */
+static void swap_pace(uint64_t val)
+{
+    const size_t n = ARRAY_SIZE(g_pd.swap_vals);
+    const uint64_t old = g_pd.swap_vals[g_pd.swap_vpos % n];
+    g_pd.swap_vals[g_pd.swap_vpos++ % n] = val;
+    if (old && hle_tl_completed() < old) {
+        uint32_t pa = hle_hitch_enter(HLE_ACT_GPU);
+        hle_tl_wait(old);
+        hle_hitch_leave(pa);
+    }
+}
+
 /* FLIP_INCREMENT_WRITE: the frame in the colour target is done; it goes to
  * the display (D3D's vblank handler shows it there too). The display scans
  * out D3D's back buffer, whatever is bound: a target smaller than the
@@ -1437,7 +1533,8 @@ static void swap(void)
     __atomic_store_n(&g_pd.shown_ns, hle_now_ns(), __ATOMIC_RELAXED);
     g_pd.shown_written = fo ? fo->written : 0;
     HleCmdSwap *c = begin(HLE_OP_SWAP, sizeof(*c));
-    c->value = hle_fe_next_value();
+    const uint64_t val = hle_fe_next_value();
+    c->value = val;
     c->swap_id = ++g_pd.swap_ids;
     shown_part(fo, ax, ay, &c->src_w, &c->src_h);
     g_pd.swaps++;
@@ -1458,6 +1555,7 @@ static void swap(void)
     }
     g_pd.swap_wseq = g_pd.wseq;
     __atomic_store_n(&g_pd.ahead_pa, 0, __ATOMIC_RELEASE);
+    swap_pace(val);
 }
 
 void hle_pbd_trap(void)
@@ -1557,7 +1655,22 @@ void hle_pbd_display(uint32_t pa, bool flip)
         g_pd.swaps_seen = g_pd.swaps;
         return;
     }
-    uint32_t id = object_at(pa & 0x0FFFFFFFu);
+    const uint32_t base = pa & 0x0FFFFFFFu;
+    uint32_t id = object_at(base);
+    if (!id) {
+        /* Interlaced modes (e.g. 1080i) shift PCRTC_START by -pitch on odd
+         * fields (D3D's vblank ISR alternates Surface->Data and Data - Pitch). */
+        uint32_t pitch, xfmt;
+        unsigned hz;
+        hle_pb_display_mode_get(&pitch, &xfmt, &hz);
+        if (pitch) {
+            const uint32_t cand = object_at((base + pitch) & 0x0FFFFFFFu);
+            const PbObj *co = cand ? obj_of(cand) : NULL;
+            if (co && co->d.pitch == pitch) {
+                id = cand;
+            }
+        }
+    }
     if (!id) {
         static unsigned s_logged;
         if (s_logged++ < 4) {
@@ -1669,12 +1782,39 @@ void hle_pbd_scanout(void)
     present_now(g_pd.shown_id);
 }
 
+/* AvSetDisplayMode with a D3D device already up (e.g. D3DDevice::PersistDisplay
+ * blits the splash screen into a persistent buffer, switches CRTC to it, and
+ * releases the old device whose front buffer is then freed and reused). */
+static void display_mode_fb(uint32_t pa)
+{
+    const uint32_t id = object_at(pa & 0x0FFFFFFFu);
+    PbObj *o = id ? obj_of(id) : NULL;
+    if (!o || !o->written || id == g_pd.shown_id) {
+        return;
+    }
+    const uint32_t prev = g_pd.shown_id;
+    coh_shown(o);
+    front_stale(rt_cpu_sync(id) ? NULL : o);
+    uint32_t tail = __atomic_load_n(&g_pd.pend_tail, __ATOMIC_ACQUIRE);
+    const uint32_t head = __atomic_load_n(&g_pd.pend_head, __ATOMIC_ACQUIRE);
+    while (tail != head &&
+           !__atomic_compare_exchange_n(&g_pd.pend_tail, &tail, head, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+    }
+    present_now(id);
+    hle_log("hakuX-hle-pb", "display mode fb %08x: shows %u (was %u)", pa, id, prev);
+}
+
 void hle_pbd_cpu_display(uint32_t pa)
 {
     uint32_t pitch, xfmt, w, h, seq;
     unsigned hz;
-    if (!g_pd.on || g_pd.device) {
-        return;                             /* D3D's: its own frames, flipped */
+    if (!g_pd.on) {
+        return;
+    }
+    if (g_pd.device) {
+        display_mode_fb(pa);
+        return;
     }
     hle_pb_display_mode_get(&pitch, &xfmt, &hz);
     if (!mode_size(0, &w, &h, &seq)) {
@@ -2077,11 +2217,19 @@ static bool face_target(const PbObj *o, uint32_t pa, uint32_t w, uint32_t bytes)
  * face 0's 2D image, the cars' glass and roofs came out white. Sega GT
  * 2002's sun cube for its cars' highlights is cleared black each frame
  * through linear targets (five faces) and its sun drawn into the sixth
- * swizzled: with swizzled faces only, no cube, and the cars were white. */
+ * swizzled: with swizzled faces only, no cube, and the cars were white.
+ * Its slot can be another's (new_slot): never one of its faces'. */
+static void cube_used(PbObj *c)
+{
+    c->sampled_bind = g_pd.binds;
+    c->sampled_epoch = g_pd.epoch;
+}
+
 static uint32_t cube_of_targets(uint32_t pa, uint32_t code, uint32_t w, uint32_t stride)
 {
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         if (g_pd.objs[i].cube && g_pd.objs[i].d.pa == pa && g_pd.objs[i].d.w == w) {
+            cube_used(&g_pd.objs[i]);
             return g_pd.objs[i].id;
         }
     }
@@ -2096,14 +2244,23 @@ static uint32_t cube_of_targets(uint32_t pa, uint32_t code, uint32_t w, uint32_t
                 xfmt = g_pd.objs[i].d.xfmt;
             }
         }
-        if (!found || g_pd.nobjs >= MAX_OBJS) {
+        if (!found) {
             return 0;
         }
     }
-    PbObj *c = &g_pd.objs[g_pd.nobjs++];
+    PbObj *c = new_slot(pa, 6 * stride);    /* the faces stay */
+    if (!c) {
+        static unsigned s_full;
+        if (s_full++ < 8) {
+            hle_log("hakuX-hle-pb", "cube %08x: all %u objects in use, sampled as face 0 (first 8 logged)",
+                    pa, MAX_OBJS);
+        }
+        return 0;
+    }
     memset(c, 0, sizeof(*c));
     c->id = g_pd.next_id++;
     c->cube = true;
+    cube_used(c);
     c->d = (HleSurfDesc){ .id = c->id, .xfmt = xfmt, .w = w, .h = w, .pa = pa, .levels = 1, .faces = 6 };
     HleCmdObj *oc = begin(HLE_OP_OBJ_CREATE, sizeof(*oc));
     oc->s = c->d;
@@ -2562,8 +2719,10 @@ static uint32_t target_part(uint32_t pa, uint32_t code, const HleFmtInfo *fi, ui
         return dst ? dst->id : 0;           /* the image there is the newer */
     }
     if (!dst) {
+        const uint32_t sid = src->id;
         dst = obj_of(object(pa, code, pitch, w, h));
-        if (!dst || dst == src) {
+        src = obj_of(sid);                  /* a freed cube closes the table up (cube_free) */
+        if (!dst || !src || dst == src) {
             return 0;
         }
     }

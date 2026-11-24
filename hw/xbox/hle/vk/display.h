@@ -60,5 +60,9 @@ uint32_t hle_disp_gamma_seq(void);
 /* The front frame's generation and swap id, without taking it (the
  * presenter's look for a new frame); false: none. */
 bool hle_disp_front(uint32_t *gen, uint32_t *swap_id);
+/* Called on the presenter's thread with each frame it picks up the first
+ * time: its swap id and the time (CLOCK_MONOTONIC, us). For input timings
+ * (native/dev/xid.c); NULL removes it. */
+void hle_disp_on_shown(void (*fn)(uint32_t swap_id, int64_t t_us));
 
 #endif

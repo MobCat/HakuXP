@@ -298,6 +298,13 @@ bool hle_disp_present(uint32_t swap_id)
     return found;
 }
 
+static void (*volatile g_shown_hook)(uint32_t swap_id, int64_t t_us);
+
+void hle_disp_on_shown(void (*fn)(uint32_t swap_id, int64_t t_us))
+{
+    __atomic_store_n(&g_shown_hook, fn, __ATOMIC_RELEASE);
+}
+
 bool hle_disp_acquire(HleDispFrame *f)
 {
     bool found = false;
@@ -323,6 +330,10 @@ bool hle_disp_acquire(HleDispFrame *f)
     hle_mutex_unlock(&g_disp.lock);
     if (shown) {
         hle_hitch_frame(shown, HLE_FR_SHOWN);   /* a new frame on screen */
+        void (*hook)(uint32_t, int64_t) = __atomic_load_n(&g_shown_hook, __ATOMIC_ACQUIRE);
+        if (hook) {
+            hook(shown, g_get_monotonic_time());
+        }
     }
     return found;
 }

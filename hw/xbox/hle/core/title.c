@@ -61,7 +61,7 @@ void hle_title_start(void)
         return;
     }
     lib_ranges(t);
-    hle_log("hakuX-hle-mode", "title %08x: push-buffer mode", t->xbe.title_id);
+    hle_log("hakuX-hle-mode", "title %08X: push-buffer mode", t->xbe.title_id);
     hle_probe_register();                   /* debug: HAKUX_HLE_PROBE */
     hle_pb_start();
     hle_host_code_changed();
