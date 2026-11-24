@@ -17,6 +17,11 @@
 #include "native/kernel/kernel.h"
 #include "hw/xbox/hle/host.h"
 #include "native/core/irq.h"
+#include "native/dev/inputsync.h"
+#include "native/kernel/detclock.h"
+#include "native/kernel/calltrace.h"
+#include "native/kernel/memtrace.h"
+#include "native/kernel/detevents.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -179,7 +184,8 @@ static void hold_report(unsigned l)
 
 bool nc_intr_dispatch(NcKernel *k, bool cpu_enabled)
 {
-    const uint32_t lines = nc_irq_lines();
+    nc_detev_check();           /* a playbook's vblank the title never waited for */
+    uint32_t lines = nc_irq_lines();
     if (!lines) {
         return false;
     }
@@ -187,6 +193,15 @@ bool nc_intr_dispatch(NcKernel *k, bool cpu_enabled)
         hold_note(k, lines, k->in_isr ? HOLD_ISR : HOLD_IF);
         return false;
     }
+    /* A playbook's tick at the title's vblank: the pad's USB frames run
+     * here, and the line they raise is served before the vblank's */
+    if (nc_inputsync_on()) {
+        nc_inputsync_irq(lines);
+        lines = nc_irq_lines();
+    }
+    nc_detclock_irq(lines);     /* the title's clock, a playbook's: a vblank moves it on */
+    nc_calltrace_irq(lines);    /* debug: NC_TRACE_EIP's line each vblank */
+    nc_memtrace_irq(k, lines);  /* debug: NC_TRACE_MEM's page hashes each vblank */
     /* The highest IRQL first: the lowest bus level. */
     for (unsigned level = 0; level < NC_IRQ_LINES; level++) {
         if (!(lines & (1u << level))) {

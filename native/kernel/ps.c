@@ -19,6 +19,7 @@
  *     PRCB at 0x28 starting with CurrentThread
  */
 #include "native/kernel/kernel.h"
+#include "native/kernel/detevents.h"
 
 #include <stdio.h>
 #include <time.h>
@@ -344,6 +345,25 @@ void nc_ps_yield(NcKernel *k)
     k->resched = true;
 }
 
+/* Dennou Taisen - DroneZ polls a thread's handle with NtYieldExecution at
+ * priority 8 while that thread, ready at 7, never ran: no frame for good. */
+bool nc_ps_yield_any(NcKernel *k)
+{
+    NcThread *cur = k->current;
+    nc_ps_yield(k);         /* the pass runs either way: it polls timers and waits */
+    if (!cur) {
+        return false;
+    }
+    for (unsigned i = 0; i < k->threads_hi; i++) {
+        const NcThread *t = &k->threads[i];
+        if (t != cur && t->state == NC_T_READY && !t->suspend) {
+            cur->yield_any = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 void nc_ps_schedule(NcKernel *k, NcFrame *f)
 {
     g_nc_sched.schedules++;
@@ -369,6 +389,11 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
      * ran out goes to the back with a new one; one that waits gets a new one
      * and its place when it is ready again. */
     const uint64_t now = nc_ke_now_ns();
+    /* NtYieldExecution's thread sits this pick out (nc_ps_yield_any) */
+    NcThread *const yielder = cur && cur->yield_any && cur->state == NC_T_RUNNING ? cur : NULL;
+    if (cur) {
+        cur->yield_any = false;
+    }
     if (cur && cur->state == NC_T_RUNNING) {
         if (cur->slice_expired) {
             cur->ready_seq = ++k->ready_clock;
@@ -414,7 +439,7 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
         } else {
             for (unsigned n = 0; n < NC_MAX_THREADS; n++) {
                 NcThread *t = &k->threads[(start + n) % NC_MAX_THREADS];
-                if (t->state != NC_T_READY || t->suspend) {
+                if (t->state != NC_T_READY || t->suspend || t == yielder) {
                     continue;
                 }
                 if (!t->ready_seq) {
@@ -425,9 +450,18 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
                     next = t;
                 }
             }
+            if (!next && yielder && yielder->state == NC_T_READY && !yielder->suspend) {
+                next = yielder;         /* nothing else became ready meanwhile */
+            }
         }
         if (next) {
             break;
+        }
+        /* Every thread waits: a playbook's vblank comes here, at the title's
+         * own point (detevents.h); the loop dispatches it */
+        const int det = nc_detev_idle();
+        if (det == NC_DETEV_GIVEN) {
+            continue;
         }
         /* Idle. With no timeout pending only an interrupt can wake a thread:
          * give up after a while without one. Paused meanwhile, here it
@@ -442,7 +476,8 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
             return;
         }
         g_nc_sched.idles++;
-        nc_irq_idle_wait(deadline ? nc_ke_host_ns(deadline) : 0, 1000000000u);    /* on the host's clock */
+        nc_irq_idle_wait(deadline ? nc_ke_host_ns(deadline) : 0,
+                         det == NC_DETEV_WAIT ? 200000u : 1000000000u);    /* on the host's clock */
         nc_ke_update_time(k);
     }
     if (next == k->resume_first) {
@@ -643,9 +678,36 @@ void nc_ps_register(NcKernel *k)
     nc_kernel_impl(k, "KeResumeThread", KeResumeThread);
 }
 
+static bool phys_rd8(const NcVm *vm, uint32_t va, uint8_t *out)
+{
+    const uint32_t pa = nc_vm_phys(vm, va);
+    if (pa == UINT32_MAX || pa >= vm->ram_size) {
+        return false;
+    }
+    *out = vm->phys[pa];
+    return true;
+}
+
+static bool phys_rd32(const NcVm *vm, uint32_t va, uint32_t *out)
+{
+    uint8_t b[4];
+    for (unsigned i = 0; i < 4; i++) {
+        if (!phys_rd8(vm, va + i, &b[i])) {
+            return false;
+        }
+    }
+    *out = nc_rd32(b);
+    return true;
+}
+
+static void dump_threads_fd(void *ctx, const char *line, size_t len)
+{
+    nc_dump_line(*(const int *)ctx, line, len);
+}
+
 /* Every thread for a fault or timeout report: what it is doing or waiting
  * for (dispatcher type, signal state), and the top of its stack. */
-void nc_kernel_dump_threads(NcKernel *k, int fd)
+void nc_kernel_dump_threads_cb(const NcKernel *k, NcDumpEmitFn emit, void *ctx)
 {
     static const char *const k_state[] = {"free", "ready", "running", "waiting", "suspended", "terminated"};
     char line[640];
@@ -669,31 +731,44 @@ void nc_kernel_dump_threads(NcKernel *k, int fd)
             }
             for (unsigned w = 0; w < t->wait.count && w < 6; w++) {
                 const uint32_t o = t->wait.objects[w];
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " %08x(type %u sig %d)", o,
-                              nc_vm_phys(k->vm, o) != UINT32_MAX ? *(const uint8_t *)nc_vm_host(k->vm, o) : 0xFF,
-                              nc_vm_phys(k->vm, o + 4) != UINT32_MAX ? (int)nc_vm_rd32(k->vm, o + 4) : -1);
+                uint8_t type = 0xFF;
+                uint32_t sig = (uint32_t)-1;
+                phys_rd8(k->vm, o, &type);
+                phys_rd32(k->vm, o + 4, &sig);
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " %08x(type %u sig %d)", o, type, (int)sig);
             }
             if (t->wait.cs) {
                 n += snprintf(line + n, sizeof(line) - (size_t)n, " cs %08x", t->wait.cs);
             }
         }
-        if (nc_vm_phys(k->vm, esp) != UINT32_MAX) {
+        uint32_t word = 0;
+        if (phys_rd32(k->vm, esp, &word)) {
             n += snprintf(line + n, sizeof(line) - (size_t)n, " | stack");
-            for (unsigned w = 0; w < 8 && nc_vm_phys(k->vm, esp + 4 * w) != UINT32_MAX; w++) {
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " %08x", nc_vm_rd32(k->vm, esp + 4 * w));
+            for (unsigned w = 0; w < 8 && phys_rd32(k->vm, esp + 4 * w, &word); w++) {
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " %08x", word);
             }
             /* Return address candidates deeper down: dwords inside the title image. */
             n += snprintf(line + n, sizeof(line) - (size_t)n, " | calls");
             unsigned found = 0;
-            for (unsigned w = 8; w < 512 && found < 12 && nc_vm_phys(k->vm, esp + 4 * w) != UINT32_MAX; w++) {
-                const uint32_t v = nc_vm_rd32(k->vm, esp + 4 * w);
-                if (v >= k->xbe_base && v < k->xbe_base + k->xbe_size) {
-                    n += snprintf(line + n, sizeof(line) - (size_t)n, " %08x", v);
+            for (unsigned w = 8; w < 512 && found < 12 && phys_rd32(k->vm, esp + 4 * w, &word); w++) {
+                if (word >= k->xbe_base && word < k->xbe_base + k->xbe_size) {
+                    n += snprintf(line + n, sizeof(line) - (size_t)n, " %08x", word);
                     found++;
                 }
             }
         }
+        if (n < 0) {
+            continue;
+        }
+        if ((size_t)n >= sizeof(line) - 1) {
+            n = (int)(sizeof(line) - 2);
+        }
         line[n++] = '\n';
-        nc_dump_line(fd, line, (size_t)n);
+        emit(ctx, line, (size_t)n);
     }
+}
+
+void nc_kernel_dump_threads(NcKernel *k, int fd)
+{
+    nc_kernel_dump_threads_cb(k, dump_threads_fd, &fd);
 }

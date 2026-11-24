@@ -12,7 +12,8 @@
  * scheduler runs. A blocked kernel call returns its status later, written
  * into the thread's saved EAX when the wait ends.
  */
-#include "native/kernel/kernel.h"
+#include "native/kernel/iomgr.h"
+#include "native/kernel/detclock.h"
 #include "hw/xbox/hle/host.h"
 
 #include <pthread.h>
@@ -260,9 +261,38 @@ static uint64_t since_boot_100ns(void)
     return (nc_ke_now_ns() - g_boot_ns) / 100u;
 }
 
+/* The time the title is told (100 ns since boot): a playbook's clock
+ * (detclock.h) when on, step: a guest's read, which moves its thread's on;
+ * else the guest's time. */
+static uint64_t told_since_boot_100ns(bool step)
+{
+    uint64_t ns;
+    if (nc_detclock_since_boot_ns(!step, &ns)) {
+        return ns / 100u;
+    }
+    return since_boot_100ns();
+}
+
 uint64_t nc_ke_system_time(void)
 {
-    return BOOT_FILETIME + g_time_offset + since_boot_100ns();
+    return BOOT_FILETIME + g_time_offset + told_since_boot_100ns(false);
+}
+
+/* The guest's time (nc_ke_now_ns's clock) as the title is told it: a
+ * playbook's clock when on (step: the reading thread's next value; else the
+ * frame's floor). The GPU's timer and raster read it (native/dev/nv2a.c). */
+uint64_t nc_ke_told_ns(bool step)
+{
+    uint64_t ns;
+    if (nc_detclock_since_boot_ns(!step, &ns)) {
+        return g_boot_ns + ns;
+    }
+    return nc_ke_now_ns();
+}
+
+void nc_ke_det_epoch(void)
+{
+    g_time_offset = NC_DETCLOCK_EPOCH - BOOT_FILETIME;
 }
 
 uint64_t nc_ke_interrupt_time(void)
@@ -481,6 +511,11 @@ static void signaled(NcKernel *k)
     }
 }
 
+void nc_ke_signaled(NcKernel *k)
+{
+    signaled(k);
+}
+
 /* A poll (a zero timeout) found nothing signaled. One poll is NT's: the
  * thread keeps the CPU. A thread polling back to back (Bink's scheduler in
  * Halo, Panzer Dragoon Orta's loader: a million and a half polls a second,
@@ -677,16 +712,24 @@ static uint64_t KePulseEvent(NcKernel *k, NcFrame *f, const uint32_t *a)
     return old;
 }
 
-/* NtCreateEvent(EventHandle, ObjectAttributes, EventType, InitialState) */
+/* NtCreateEvent(EventHandle, ObjectAttributes, EventType, InitialState): a name
+ * already taken opens that event (XAPI's CreateEvent passes OBJ_OPENIF). */
 static uint64_t NtCreateEvent(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    uint32_t ev = nc_ob_create(k, NC_OB_EVENT, 0x10);
-    if (!ev) {
-        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    char path[256];
+    uint32_t ev, st;
+    const int named = nc_obname_precreate(k, a[1], NC_OB_EVENT, path, sizeof(path), &ev, &st);
+    if (named < 0) {
+        return st;
     }
-    init_header(k, ev, (uint8_t)a[2], 4, (int32_t)(a[3] & 0xff));
-    nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, ev, NC_OB_EVENT));
-    return NC_STATUS_SUCCESS;
+    if (!named) {
+        ev = nc_ob_create(k, NC_OB_EVENT, 0x10);
+        if (!ev) {
+            return NC_STATUS_INSUFFICIENT_RESOURCES;
+        }
+        init_header(k, ev, (uint8_t)a[2], 4, (int32_t)(a[3] & 0xff));
+    }
+    return nc_obname_created(k, a[0], ev, NC_OB_EVENT, path, named, st);
 }
 
 /* NtSetEvent(EventHandle, PreviousState) */
@@ -772,14 +815,21 @@ static uint64_t KeReleaseSemaphore(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtCreateSemaphore(SemaphoreHandle, ObjectAttributes, InitialCount, MaximumCount) */
 static uint64_t NtCreateSemaphore(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    uint32_t sem = nc_ob_create(k, NC_OB_SEMAPHORE, 0x14);
-    if (!sem) {
-        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    char path[256];
+    uint32_t sem, st;
+    const int named = nc_obname_precreate(k, a[1], NC_OB_SEMAPHORE, path, sizeof(path), &sem, &st);
+    if (named < 0) {
+        return st;
     }
-    init_header(k, sem, OBJ_SEMAPHORE, 5, (int32_t)a[2]);
-    nc_vm_wr32(k->vm, sem + SEMAPHORE_LIMIT, a[3]);
-    nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, sem, NC_OB_SEMAPHORE));
-    return NC_STATUS_SUCCESS;
+    if (!named) {
+        sem = nc_ob_create(k, NC_OB_SEMAPHORE, 0x14);
+        if (!sem) {
+            return NC_STATUS_INSUFFICIENT_RESOURCES;
+        }
+        init_header(k, sem, OBJ_SEMAPHORE, 5, (int32_t)a[2]);
+        nc_vm_wr32(k->vm, sem + SEMAPHORE_LIMIT, a[3]);
+    }
+    return nc_obname_created(k, a[0], sem, NC_OB_SEMAPHORE, path, named, st);
 }
 
 /* NtReleaseSemaphore(SemaphoreHandle, ReleaseCount, PreviousCount) */
@@ -830,13 +880,20 @@ static uint64_t KeReleaseMutant(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtCreateMutant(MutantHandle, ObjectAttributes, InitialOwner) */
 static uint64_t NtCreateMutant(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    uint32_t m = nc_ob_create(k, NC_OB_MUTANT, 0x20);
-    if (!m) {
-        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    char path[256];
+    uint32_t m, st;
+    const int named = nc_obname_precreate(k, a[1], NC_OB_MUTANT, path, sizeof(path), &m, &st);
+    if (named < 0) {
+        return st;
     }
-    init_mutant(k, m, a[2] & 0xff);
-    nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, m, NC_OB_MUTANT));
-    return NC_STATUS_SUCCESS;
+    if (!named) {
+        m = nc_ob_create(k, NC_OB_MUTANT, 0x20);
+        if (!m) {
+            return NC_STATUS_INSUFFICIENT_RESOURCES;
+        }
+        init_mutant(k, m, a[2] & 0xff);
+    }
+    return nc_obname_created(k, a[0], m, NC_OB_MUTANT, path, named, st);
 }
 
 /* NtReleaseMutant(MutantHandle, PreviousCount) */
@@ -982,7 +1039,7 @@ static uint64_t KeDelayExecutionThread(NcKernel *k, NcFrame *f, const uint32_t *
 /* NtYieldExecution() */
 static uint64_t NtYieldExecution(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    nc_ps_yield(k);         /* behind the ready threads of its priority */
+    nc_ps_yield_any(k);     /* to any ready thread, a lower priority's too */
     return NC_STATUS_SUCCESS;
 }
 
@@ -1266,7 +1323,7 @@ static uint64_t InterlockedCompareExchange(NcKernel *k, NcFrame *f, const uint32
 /* KeQuerySystemTime(CurrentTime) */
 static uint64_t KeQuerySystemTime(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    uint64_t t = nc_ke_system_time();
+    uint64_t t = BOOT_FILETIME + g_time_offset + told_since_boot_100ns(true);
     nc_vm_wr32(k->vm, a[0], (uint32_t)t);
     nc_vm_wr32(k->vm, a[0] + 4, (uint32_t)(t >> 32));
     return 0;
@@ -1316,13 +1373,13 @@ static void clock_boot(void)
 /* KeQueryInterruptTime() -> 100 ns since boot */
 static uint64_t KeQueryInterruptTime(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    return since_boot_100ns();
+    return told_since_boot_100ns(true);
 }
 
 /* KeQueryPerformanceCounter() */
 static uint64_t KeQueryPerformanceCounter(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    const uint64_t ns = nc_ke_now_ns() - g_boot_ns;
+    const uint64_t ns = told_since_boot_100ns(true) * 100u;
     return (uint64_t)((unsigned __int128)ns * PERF_FREQUENCY / 1000000000u);
 }
 

@@ -351,6 +351,11 @@ static void mul_mod(uint32_t *r, const uint32_t *a, const uint32_t *b, const uin
     free(p);
 }
 
+void nc_bn_mod(uint32_t *r, const uint32_t *x, unsigned xn, const uint32_t *m, unsigned n)
+{
+    mod_reduce(r, x, xn, m, n);
+}
+
 bool nc_modexp(uint32_t *a, const uint32_t *b, const uint32_t *c, const uint32_t *d, unsigned n)
 {
     bool nonzero = false;

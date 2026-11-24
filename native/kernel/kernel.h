@@ -25,11 +25,19 @@ extern "C" {
 
 #define NC_KERNEL_VA     0x80010000u
 #define NC_KERNEL_PA     0x00010000u
-#define NC_KERNEL_SIZE   0x00040000u
+/* The kernel area's physical pages (kernel.c lays out 0x13000 of it). What
+ * lies between the kernel pool's first range and Halo's fixed 0x61000 is
+ * the title's: see POOL_BASE in kernel.c. */
+#define NC_KERNEL_SIZE   0x00020000u
 #define NC_KCALL_VECTOR  0x3Fu
 /* In the KPCR's page, past its fields (guest code reads it at fs:): 1 while
  * DPCs are queued (timer.c), for the guest-code KfLowerIrql (kernel.c). */
 #define NC_KPCR_DPC_PENDING 0x800u
+/* Also there: the object namespace's first name record (obname.c), kept in
+ * guest memory so that a savestate holds the names. */
+#define NC_KPCR_OBNAMES     0x900u
+/* ... and the kernel drivers' objects (iodrv.c): the disc's +0, the hard disk's +4. */
+#define NC_KPCR_IODRV       0x904u
 #define NC_KORDINAL_MAX  512u
 #define NC_KORDINAL_THREAD_RETURN 0x3FFu  /* a thread's start routine returned */
 #define NC_KORDINAL_DPC_RETURN    0x3FEu  /* a DPC routine returned */
@@ -41,6 +49,8 @@ extern "C" {
 #define NC_KORDINAL_SEH_NESTED    0x3F8u  /* the kernel's handler around a handler call */
 #define NC_KORDINAL_SEH_COLLIDED  0x3F7u  /* the same, during an unwind */
 #define NC_KORDINAL_APU_SPIN      0x3F5u  /* DirectSound waits on the GP DSP's mailbox (fixups.c) */
+#define NC_KORDINAL_IO_DRIVER     0x3F6u  /* a kernel driver's dispatch routine was called (iodrv.c) */
+#define NC_KORDINAL_KCONT         0x3F4u  /* a guest routine a kernel call ran returned (kcont.c) */
 
 enum NcKAbi { NC_KABI_STDCALL, NC_KABI_FASTCALL, NC_KABI_CDECL, NC_KABI_DATA };
 
@@ -71,7 +81,7 @@ typedef uint64_t (*NcKFn)(NcKernel *k, NcFrame *f, const uint32_t *args);
 
 /* Guest object types: the VA of the kernel's type-object data export. */
 enum NcObType { NC_OB_THREAD, NC_OB_EVENT, NC_OB_SEMAPHORE, NC_OB_MUTANT, NC_OB_TIMER, NC_OB_FILE,
-                NC_OB_DEVICE, NC_OB_SYMLINK, NC_OB_DIRECTORY, NC_OB_TYPES };
+                NC_OB_DEVICE, NC_OB_SYMLINK, NC_OB_DIRECTORY, NC_OB_IOCOMPLETION, NC_OB_TYPES };
 
 #define NC_MAX_THREADS 128
 /* The Xbox kernel's handle table grows as it fills. Super Monkey Ball
@@ -161,6 +171,9 @@ typedef struct NcThread {
     uint64_t ready_seq, run_seq;
     uint64_t slice_used_ns, slice_start_ns;
     bool slice_expired;
+    bool yield_any;          /* NtYieldExecution: the next pick passes it over (nc_ps_yield_any) */
+    /* detclock.c (playbooks): the last TSC and ns since boot this thread read */
+    uint64_t det_tsc, det_ns;
     NcCpuContext ctx;
 } NcThread;
 
@@ -273,8 +286,23 @@ struct NcKernel {
 
     bool stop;
     char stop_reason[512];
+    /* Guest CPU/fault state captured when the kernel requests a stop, for crash reports. */
+    struct {
+        bool valid;
+        bool has_fault;
+        bool fault_write;
+        uint32_t fault_va;
+        uint32_t exception_code;
+        uint32_t thread_id;
+        uint32_t eip;
+        uint32_t eflags;
+        uint32_t gpr[8]; /* NC_EAX .. NC_EDI */
+        uint16_t cs;
+        uint16_t ss;
+    } stop_info;
     bool relaunch;             /* stopped for a quick reboot into another XBE (relaunch.bin) */
     bool quit;                 /* stopped as the title left: to the dashboard, a reboot, a shutdown */
+    bool need_dashboard;       /* stopped because the title requested a dashboard feature and none is installed */
     char image_path[128];      /* XeImageFileName ("" = \Device\CdRom0\default.xbe) */
     uint64_t calls;
     unsigned first_ordinal;    /* first kernel call made (0: none yet) */
@@ -320,6 +348,8 @@ void nc_kernel_frame_chain(NcKernel *k, NcFrame *f, char *buf, size_t len);
 /* Allocates an object (OBJECT_HEADER + zeroed body) and returns the body VA. */
 /* ObfDereferenceObject: an object no one holds any more is freed (ob.c). */
 void nc_ob_dereference(NcKernel *k, uint32_t object);
+/* ObfReferenceObject n times: PointerCount += n. */
+void nc_ob_reference(NcKernel *k, uint32_t object, uint32_t n);
 uint32_t nc_ob_create(NcKernel *k, enum NcObType type, uint32_t body_size);
 uint32_t nc_ob_handle(NcKernel *k, uint32_t object, enum NcObType type);
 uint32_t nc_ob_lookup(NcKernel *k, uint32_t handle, enum NcObType *type);
@@ -336,6 +366,12 @@ void nc_ps_slice_end(NcKernel *k, uint64_t now);
 /* The running thread gives way (Sleep(0), polling) to a ready thread of its
  * priority or above: rescheduled at the back of its priority's queue. */
 void nc_ps_yield(NcKernel *k);
+/* NtYieldExecution: the running thread gives way to any ready thread, of a
+ * lower priority too, as NT's does (KiFindReadyThread from priority 1):
+ * the next pick passes it over, and it is back at the next one after that
+ * (at the latest the other thread's quantum end, nc_ps_slice_end). False
+ * when no other thread is ready (NT's STATUS_NO_YIELD_PERFORMED). */
+bool nc_ps_yield_any(NcKernel *k);
 /* debug (debug.hakux.ncresume=<id>): NtResumeThread on thread t<id> */
 void nc_ps_debug_resume(NcKernel *k, unsigned id);
 void nc_ps_terminate_current(NcKernel *k, uint32_t status);
@@ -402,11 +438,18 @@ void nc_kernel_set_language(int language);
  * phone's offset from UTC, minutes east. */
 void nc_kernel_set_clock(int64_t offset_ms);
 void nc_kernel_set_time_zone(int minutes_east);
+/* ex.c: the EEPROM's time zone whole, 0x64-0x8F as 88 hex digits (bias,
+ * names, daylight saving dates and biases, as the dashboard sets them; the
+ * app's ConsoleTimeZone), over nc_kernel_set_time_zone's bias alone. False:
+ * not 44 bytes of hex, nothing changed. */
+bool nc_kernel_set_time_zone_info(const char *hex);
 void nc_kernel_apu_spin(NcKernel *k, NcFrame *f);
 
-/* seh.c: RtlRaiseException and RtlUnwind, and their stubs. */
+/* seh.c: RtlRaiseException, RtlUnwind, hardware access-violation SEH dispatch, and their stubs. */
 void nc_seh_register(NcKernel *k);
 void nc_seh_stub(NcKernel *k, NcFrame *f, unsigned ordinal);
+bool nc_seh_page_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write);
+bool nc_mm_has_reserved(void);
 /* After the XBE is loaded: what the kernel exposes about the title. xbe_fd:
  * the XBE's host file when it isn't on the disc (else -1). */
 void nc_kernel_title_loaded(NcKernel *k, const struct NcDisc *disc, const struct NcDiscFile *xbe, int xbe_fd,
@@ -438,6 +481,10 @@ bool nc_kernel_launch_xbe(const uint8_t page[NC_LAUNCH_PAGE], char *out, size_t 
 /* The dashboard, booted when a title asks for one of its pages (Xbox Live's
  * account sign-up, its network settings) or by itself (the app's Dashboard). */
 #define NC_DASHBOARD_PATH "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe"
+/* Override the dashboard XBE device path (e.g. from a dashboard manifest's
+ * entryXbe); defaults to NC_DASHBOARD_PATH when unset or invalid. */
+void nc_kernel_set_dashboard_path(const char *path);
+const char *nc_kernel_dashboard_path(void);
 /* After title_loaded on a relaunch: a contiguous page with page's contents
  * becomes LaunchDataPage. */
 void nc_kernel_launch_page_restore(NcKernel *k, const uint8_t page[NC_LAUNCH_PAGE]);
@@ -449,6 +496,9 @@ void nc_ke_register(NcKernel *k);
 uint32_t nc_ke_set_event(NcKernel *k, uint32_t event);
 /* KeClearEvent. */
 void nc_ke_clear_event(NcKernel *k, uint32_t event);
+/* A dispatcher object's state rose (a queue got an entry): waiters it
+ * satisfies wake. */
+void nc_ke_signaled(NcKernel *k);
 /* KeInitializeEvent: type 0 notification, 1 synchronization. */
 void nc_ke_init_event(NcKernel *k, uint32_t event, unsigned type, bool signaled);
 /* The running thread waits for the host's work for its call (no object, no
@@ -498,6 +548,17 @@ int nc_x86mmio_site_state(uint32_t eip);
 /* Now as NT times: system time (FILETIME) and interrupt time (since boot), 100 ns. */
 uint64_t nc_ke_system_time(void);
 uint64_t nc_ke_interrupt_time(void);
+/* A playbook's boot (detclock.h): the console's date the same every run,
+ * NC_DETCLOCK_EPOCH, not the phone's. Before the guest runs. */
+void nc_ke_det_epoch(void);
+/* The guest's time as the title is told it (ns since boot): a playbook's
+ * clock (detclock.h) while on, else nc_ke_now_ns. step: a read the title
+ * makes (its thread's sequence moves on), not a peek. */
+uint64_t nc_ke_told_ns(bool step);
+/* kstate.c: the loaded savestate's time since boot (ns) and RDTSC count
+ * (host counter ticks, nc_cpu_guest_cycles'), exactly as saved; false
+ * when no state was loaded. */
+bool nc_kern_state_loaded_clock(uint64_t *since_boot_ns, uint64_t *guest_cycles);
 /* Memory kept across a quick reboot (MmPersistContiguousMemory, mm.c): at the
  * reboot the kept ranges and the saved display address go to a file for the
  * next boot; nc_mm_keep_restore (that boot, before the title loads) puts them
@@ -578,6 +639,11 @@ bool nc_io_host_file(const char *xbox_path, char *out, size_t n);
 void nc_io_set_launch_dir(const char *dir);
 /* Console timing: reads take the console's drives' time, their thread waiting (io.c). */
 void nc_io_set_device_time(bool on);
+/* The file I/O trace (the guide's Debug > File I/O trace; NC_TRACE_IO from
+ * the start): every read and write by handle, closes, an overwrite's moved
+ * handles. Any thread; off at each start. */
+void nc_io_set_trace(bool on);
+bool nc_io_trace(void);
 /* A file object's handle closed (ob.c). */
 void nc_io_close(NcKernel *k, uint32_t object);
 /* Completes the overlapped disc reads the reader thread finished (cheap when
@@ -596,6 +662,45 @@ void nc_kernel_callout(NcKernel *k, NcFrame *f, uint32_t routine, const uint32_t
 /* The same, with the IRQL at irql while the routine runs. */
 void nc_kernel_callout_at_irql(NcKernel *k, NcFrame *f, uint32_t routine, const uint32_t *args, unsigned nargs,
                                uint8_t irql);
+
+/* kcont.c: a kernel call that runs a guest routine and then goes on in C.
+ * The continuation's number and context words are kept in a record on the
+ * guest stack (savestates resume it), so ids are stable: never reuse one. */
+enum NcKContId {
+    NC_KCONT_NONE = 0,
+    NC_KCONT_RETURN = 1,        /* the routine's EAX is the call's result */
+    NC_KCONT_IRP_COMPLETE = 2,  /* IofCompleteRequest: a completion routine returned (irp.c) */
+    NC_KCONT_STARTIO = 3,       /* IoStartPacket: StartIo returned, the IRQL goes back (irp.c) */
+    NC_KCONT_SYNC_CALLED = 4,   /* IoSynchronous*Request: the driver's dispatch returned (irp.c) */
+    NC_KCONT_SYNC_WAITED = 5,   /* ... the wait for its completion ended (irp.c) */
+    NC_KCONT_REMOVE_QUEUE = 6,  /* KeRemoveQueue, NtRemoveIoCompletion: the wait ended (kqueue.c) */
+    NC_KCONT_MAX
+};
+#define NC_KCONT_CTX 8
+/* The continuation: the routine's EAX and the context words; returns the
+ * kernel call's result, unless it runs guest code again (k->redirected). */
+typedef uint64_t (*NcKContFn)(NcKernel *k, NcFrame *f, uint32_t eax, const uint32_t *ctx, unsigned nctx);
+void nc_kcont_init(void);
+void nc_kcont_register(enum NcKContId id, NcKContFn fn);
+/* From a kernel function or a continuation: run routine(args...) (stdcall
+ * or cdecl), then cont(EAX, ctx). */
+void nc_kernel_run_guest(NcKernel *k, NcFrame *f, uint32_t routine, const uint32_t *args, unsigned nargs,
+                         enum NcKContId cont, const uint32_t *ctx, unsigned nctx);
+/* The stub's entry (kernel.c): the routine returned. */
+void nc_kcont_resume(NcKernel *k, NcFrame *f);
+/* A pseudo-ordinal's stub called as a stdcall routine of nargs arguments
+ * (a kernel driver's dispatch): fn runs as a kernel call would. */
+void nc_kernel_stub_call(NcKernel *k, NcFrame *f, NcKFn fn, unsigned nargs);
+/* Returns from the call whose return address is at esp (pop bytes), with r,
+ * unless it runs guest code first. */
+void nc_kernel_stub_finish(NcKernel *k, NcFrame *f, uint32_t esp, uint32_t pop, uint64_t r);
+/* The stub a pseudo-ordinal's routine returns to or is called at (0: none). */
+uint32_t nc_kernel_stub_va(unsigned ordinal);
+/* After a savestate's load: the stubs as this build has them (a state an
+ * older build saved lacks the newer ones). */
+void nc_kernel_stubs_restore(NcKernel *k);
+/* The export's guest-callable address (its trampoline), 0 if none. */
+uint32_t nc_kernel_export_va(const NcKernel *k, const char *name);
 
 /* apc.c: asynchronous procedure calls. */
 void nc_apc_register(NcKernel *k);
@@ -617,16 +722,27 @@ bool nc_intr_dispatch(NcKernel *k, bool cpu_enabled);
 /* An ISR returned to the stub. */
 void nc_intr_return(NcKernel *k);
 
+typedef void (*NcDumpEmitFn)(void *ctx, const char *line, size_t len);
+
 /* Writes the last kernel calls to fd (fault reports; async-signal tolerant). */
 void nc_kernel_dump_recent(int fd);
+void nc_kernel_dump_recent_cb(NcDumpEmitFn emit, void *ctx);
 /* Every guest thread: state, wait objects, top of stack (ps.c). */
 void nc_kernel_dump_threads(NcKernel *k, int fd);
+void nc_kernel_dump_threads_cb(const NcKernel *k, NcDumpEmitFn emit, void *ctx);
+/* Captures the guest registers from f into k->stop_info for crash reports. */
+void nc_kernel_capture_stop_frame(NcKernel *k, NcFrame *f);
 
 /* A guest access to va, a page the guest doesn't have (the host fault in
  * translated code, f its state there): with a page-fault handler of the
  * title's in the IDT (Fable's pager), #PF goes to it as the CPU raises it
  * and true returns; otherwise the fault is the guest's crash. */
 bool nc_kernel_page_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write);
+/* That fault when nothing takes it (no handler of the title's, or no stack
+ * to raise #PF on): the title's crash. The guest stops there, as the Xbox
+ * stops the title, and the process goes on (xboxrun's exit 7, the app's
+ * "The game stopped" and back to the library). f resumes at the HLT stub. */
+void nc_kernel_unhandled_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write);
 /* In a kernel call, before the kernel reads (or, write, fills) the guest
  * buffer [va, va+len) with host I/O, which fails rather than faults on a
  * page the guest doesn't have: such a page is paged in as for the kernel's

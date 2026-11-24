@@ -8,6 +8,7 @@
  * reached through the 0x80000000 window, so VA = 0x80000000 | PA there.
  */
 #include "native/kernel/kernel.h"
+#include "native/core/smc.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -38,6 +39,12 @@ typedef struct Region {
 
 static Region g_regions[MAX_REGIONS];
 static unsigned g_nregions;
+static bool g_has_reserved;
+
+bool nc_mm_has_reserved(void)
+{
+    return g_has_reserved;
+}
 
 typedef struct Contig {
     uint32_t va, size;
@@ -240,6 +247,7 @@ static void decommit(NcKernel *k, uint32_t va, uint32_t size)
             p += NC_PAGE;
             continue;
         }
+        nc_smc_invalidate_va(p, n * NC_PAGE);
         nc_vm_unmap(k->vm, p, n * NC_PAGE);
         for (unsigned i = 0; i < n; i++) {
             nc_vm_free_phys(k->vm, pas[i] & ~(NC_PAGE - 1), NC_PAGE);
@@ -277,6 +285,9 @@ static uint64_t NtAllocateVirtualMemory(NcKernel *k, NcFrame *f, const uint32_t 
         }
         if (!add_region(base, size, a[4], false)) {
             return NC_STATUS_NO_MEMORY;
+        }
+        if (!(type & MEM_COMMIT)) {
+            g_has_reserved = true;
         }
     } else {
         uint32_t end = nc_align_up(base + size, NC_PAGE);
@@ -347,6 +358,7 @@ static uint64_t NtFreeVirtualMemory(NcKernel *k, NcFrame *f, const uint32_t *a)
         base &= ~(NC_PAGE - 1);
         size = end - base;
         decommit(k, base, size);
+        g_has_reserved = true;
     } else {
         return NC_STATUS_INVALID_PARAMETER;
     }
@@ -533,6 +545,28 @@ static void log_phys_map(NcKernel *k)
     nc_log("hakuX-native", "%s", line);
 }
 
+/* Out-of-memory reports: what a failed request asked for, beyond its size:
+ * its caller, its physical range (hi 0: to the top) with the memory free in
+ * it, its alignment. Halo's D3D asks for a page below 16 MiB with 1 MiB free
+ * above it. */
+static void request_text(const NcVm *vm, uint32_t lo, uint32_t hi, uint32_t align, uint32_t ra,
+                         char *out, size_t n)
+{
+    int at = snprintf(out, n, " from %08x", ra);
+    if (lo || hi) {
+        const uint32_t end = hi ? hi : vm->ram_size;
+        uint32_t pages_free = 0;
+        for (uint32_t p = lo / NC_PAGE; p < end / NC_PAGE && p < vm->ram_size / NC_PAGE; p++) {
+            pages_free += !vm->page_used[p];
+        }
+        at += snprintf(out + at, n - (size_t)at, " in %08x-%08x (%u KiB free there)", lo, end - 1,
+                       pages_free * (NC_PAGE >> 10));
+    }
+    if (align > NC_PAGE && at < (int)n) {
+        snprintf(out + at, n - (size_t)at, ", %u KiB aligned", align >> 10);
+    }
+}
+
 static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t hi, uint32_t align,
                              uint32_t protect, uint32_t ra)
 {
@@ -566,10 +600,11 @@ static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t h
          * load, after ~2500 sizing its heap at boot) is reported whole. */
         const unsigned n = ++s_failed;
         if (n <= 4 || !(n & (n - 1))) {
-            char runs[400];
+            char runs[400], asked[96];
             nc_vm_free_runs(k->vm, runs, sizeof(runs));
-            nc_log("hakuX-native", "mm: contiguous allocation of %u KiB failed (#%u; free %u KiB:%s)", size >> 10, n,
-                   nc_vm_free_bytes(k->vm) >> 10, runs);
+            request_text(k->vm, lo, hi, align, ra, asked, sizeof(asked));
+            nc_log("hakuX-native", "mm: contiguous allocation of %u KiB%s failed (#%u; free %u KiB:%s)", size >> 10,
+                   asked, n, nc_vm_free_bytes(k->vm) >> 10, runs);
             log_splitters(k);
             log_phys_map(k);
             log_holders(k, "contiguous allocation failed");
@@ -622,6 +657,7 @@ static void contig_free(NcKernel *k, uint32_t va, uint32_t ra)
 {
     Contig *c = contig_at(va);
     if (c) {
+        nc_smc_invalidate_va(va, c->size + c->slack);
         nc_vm_free_phys(k->vm, va & ~NC_CONTIG_WINDOW, c->size + c->slack);
         *c = g_contig[--g_ncontig];
     } else if (va) {
@@ -1067,5 +1103,12 @@ bool nc_mm_state_load(NcRd *r, unsigned v)
     g_ncontig = st.ncontig;
     g_nkept = st.nkept;
     g_gpu_instance_end = st.gpu_instance_end;
+    g_has_reserved = false;
+    for (unsigned i = 0; i < g_nregions; i++) {
+        if (!g_regions[i].image) {
+            g_has_reserved = true;
+            break;
+        }
+    }
     return !r->fail;
 }

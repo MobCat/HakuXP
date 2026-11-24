@@ -8,10 +8,15 @@
  *
  * Xbox names are ANSI: OBJECT_ATTRIBUTES { RootDirectory, ObjectName
  * (ANSI_STRING*), Attributes }; FILE_DIRECTORY_INFORMATION carries ANSI
- * names. I/O completes synchronously: IoStatusBlock and the event are set
- * before the call returns; APC completion routines are not delivered yet.
+ * names. File I/O here doesn't go through IRPs: a request completes in the
+ * call or on the reader thread (overlapped), its IoStatusBlock, event, APC
+ * and its file's completion port (FileCompletionInformation) told then.
+ * The driver model (IRPs, device objects, the kernel's drivers, named
+ * objects, completion objects) is in irp.c, iodrv.c, obname.c and kqueue.c
+ * (iomgr.h).
  */
-#include "native/kernel/kernel.h"
+#include "native/kernel/iomgr.h"
+#include "native/kernel/xbox_ss.h"
 #include "native/core/irq.h"
 #include "native/core/xdvdfs.h"
 
@@ -90,7 +95,8 @@ typedef struct NcFile {
      * doesn't zero what a file grows back into: growing it again (SetEndOfFile,
      * a write past the end) brings the old bytes back in that range (Forza
      * trims its unpacked cabs so). The side file goes when the handle closes;
-     * one a dead process left behind is swept at the next overwrite. */
+     * one a dead process left behind is swept at the next overwrite. Other
+     * handles open on the file move to the new one (follow_overwrite). */
     char old_path[320];  /* "" = none */
     uint64_t old_size;
     bool wrote;          /* written through this handle: synced when it closes */
@@ -175,7 +181,27 @@ static const uint64_t k_partitions[6][2] = {
     {0x00000000ull, 0x00080000ull},  {0xABE80000ull, 0x1312D6000ull}, {0x8CA80000ull, 0x1F400000ull},
     {0x00080000ull, 0x2EE00000ull}, {0x2EE80000ull, 0x2EE00000ull},  {0x5DC80000ull, 0x2EE00000ull},
 };
-static bool g_trace_io; /* NC_TRACE_IO: every read */
+/* The file I/O trace: every read and write by handle (#n), the closes, and
+ * the handles an overwrite moves. Off unless asked for, as it logs on every
+ * file access: NC_TRACE_IO from the start, or the guide's Debug > File I/O
+ * trace while a game runs (nc_io_set_trace, from the UI thread). */
+static bool g_trace_io;
+
+static bool trace_io(void)
+{
+    return __atomic_load_n(&g_trace_io, __ATOMIC_RELAXED);
+}
+
+void nc_io_set_trace(bool on)
+{
+    __atomic_store_n(&g_trace_io, on, __ATOMIC_RELAXED);
+    nc_log("hakuX-native-io", "file I/O trace %s", on ? "on" : "off");
+}
+
+bool nc_io_trace(void)
+{
+    return trace_io();
+}
 
 void nc_io_set_hdd_root(const char *path)
 {
@@ -282,6 +308,24 @@ static bool canon(const char *in, char *out, size_t cap)
         char joined[512];
         snprintf(joined, sizeof(joined), "%s\\%s", g_links[l].target, tmp + 6);
         snprintf(tmp, sizeof(tmp), "%s", joined);
+    } else if (prefix_ci(tmp, "\\??\\")) {
+        /* A longer DOS device name: the kernel's own \??\CdRom0: (Xbox Music
+         * Mixer probes "\??\CDROM0:\default.xbe" and the rest for the disc
+         * in the drive), or one a title made. Only drive letters were
+         * expanded; a name with no link stays an unknown name. */
+        const char *end = strchr(tmp + 4, '\\');
+        const size_t len = end ? (size_t)(end - tmp) : strlen(tmp);
+        char name[64];
+        if (len > 5 && len < sizeof(name) && tmp[len - 1] == ':') {
+            memcpy(name, tmp, len);
+            name[len] = 0;
+            const int l = link_find(name);
+            if (l >= 0) {
+                char joined[512];
+                snprintf(joined, sizeof(joined), "%s\\%s", g_links[l].target, end ? end + 1 : "");
+                snprintf(tmp, sizeof(tmp), "%s", joined);
+            }
+        }
     }
     /* Fold components. */
     char *parts[64];
@@ -554,11 +598,18 @@ static void flush_later(const NcFile *nf)
     close_later(&d);
 }
 
+static void drop_completion(NcKernel *k, uint32_t fo);
+
 void nc_io_close(NcKernel *k, uint32_t object)
 {
+    drop_completion(k, object);
     uint32_t i = nc_vm_rd32(k->vm, object + FO_INDEX);
     if (i < MAX_FILES && g_files[i].used) {
         NcFile *nf = &g_files[i];
+        if (trace_io()) {
+            nc_log("hakuX-native-io", "close %s #%u%s%s", nf->path, i, nf->wrote ? " (written)" : "",
+                   nf->del ? " (deleted)" : "");
+        }
         if (nf->fd >= 0 && nf->wrote) {
             close_later(nf);
         } else {
@@ -591,12 +642,58 @@ static void io_status(NcKernel *k, uint32_t iosb, uint32_t status, uint32_t info
     }
 }
 
-/* An I/O call finished: a[] is (FileHandle, Event, ApcRoutine, ApcContext,
- * IoStatusBlock, ...), as NtReadFile and its siblings take it. The event is
- * set; the APC routine runs as ApcRoutine(ApcContext, IoStatusBlock, 0) when
- * the caller next waits alertably. */
-static void complete(NcKernel *k, const uint32_t *a)
+/* The port and key a file object's completion context names (FILE_OBJECT's
+ * CompletionContext, a pool block { Port, Key } that holds a reference to
+ * the port), 0 if none. */
+#define CC_PORT  0x00u
+#define CC_KEY   0x04u
+#define CC_BYTES 0x08u
+
+uint32_t nc_io_file_port(NcKernel *k, uint32_t fo, uint32_t *key)
 {
+    const uint32_t cc = fo ? nc_vm_rd32(k->vm, fo + FO_COMPLETION) : 0;
+    if (!cc) {
+        return 0;
+    }
+    *key = nc_vm_rd32(k->vm, cc + CC_KEY);
+    return nc_vm_rd32(k->vm, cc + CC_PORT);
+}
+
+/* The file's completion context goes (its last handle closed). */
+static void drop_completion(NcKernel *k, uint32_t fo)
+{
+    const uint32_t cc = nc_vm_rd32(k->vm, fo + FO_COMPLETION);
+    if (cc) {
+        nc_vm_wr32(k->vm, fo + FO_COMPLETION, 0);
+        nc_ob_dereference(k, nc_vm_rd32(k->vm, cc + CC_PORT));
+        nc_pool_free(k, cc, CC_BYTES);
+    }
+}
+
+/* An I/O on the file a[0] finished with st and info: a completion packet to
+ * its port when it has one and the request named an ApcContext (XAPI passes
+ * its OVERLAPPED there unless the event's low bit is set). */
+static void post_completion(NcKernel *k, const uint32_t *a, uint32_t st, uint32_t info)
+{
+    enum NcObType type;
+    const uint32_t fo = a[3] ? nc_ob_lookup(k, a[0], &type) : 0;
+    uint32_t key = 0;
+    const uint32_t port = fo && type == NC_OB_FILE ? nc_io_file_port(k, fo, &key) : 0;
+    if (port) {
+        nc_kqueue_post(k, port, key, a[3], st, info);
+    }
+}
+
+/* An I/O call finished: a[] is (FileHandle, Event, ApcRoutine, ApcContext,
+ * IoStatusBlock, ...), as NtReadFile and its siblings take it, with st and
+ * info in its IoStatusBlock. The event is set; the APC routine runs as
+ * ApcRoutine(ApcContext, IoStatusBlock, 0) when the caller next waits
+ * alertably; without one, the file's completion port gets a packet. */
+static void complete(NcKernel *k, const uint32_t *a, uint32_t st, uint32_t info)
+{
+    if (!a[2]) {
+        post_completion(k, a, st, info);
+    }
     if (a[1]) {
         uint32_t ev = nc_ob_lookup(k, a[1], NULL);
         if (ev) {
@@ -709,6 +806,7 @@ typedef struct DiscJob {
     uint32_t va, n;
     uint32_t dev_us;         /* the drive's time for it (console timing), 0: none */
     uint32_t iosb, event, apc, apc_ctx;
+    uint32_t port, port_key;     /* the file's completion port (no APC routine), or 0 */
     NcThread *thread;
     uint32_t thread_id;      /* its id then: the slot may hold another thread by the end */
     bool sync;               /* a synchronous handle's: the thread waits for it (nc_ke_block) */
@@ -748,6 +846,50 @@ static void drive_wait(uint64_t due)
     }
 }
 
+static bool reader_read_chunk(const DiscJob *j, uint64_t off, uint8_t *dst, uint32_t len)
+{
+    if (j->fd >= 0) {
+        return pread(j->fd, dst, len, (off_t)off) == (ssize_t)len;
+    }
+    return nc_disc_read_file(j->disc, &j->file, off, dst, len);
+}
+
+/* Reads j's physical segments, coalescing fragmented multi-page reads into
+ * 64 KiB chunks so SD card / FUSE descriptors do not pay a syscall per page. */
+static bool reader_read_job(const DiscJob *j)
+{
+    if (j->nseg <= 1) {
+        return !j->nseg || reader_read_chunk(j, j->off, j->seg[0].host, j->seg[0].len);
+    }
+    static uint8_t bounce[65536]; /* single reader_thread only */
+    uint64_t o = j->off;
+    uint32_t left = j->n;
+    unsigned si = 0;
+    uint32_t so = 0;
+    while (left) {
+        const uint32_t chunk = left < sizeof(bounce) ? left : (uint32_t)sizeof(bounce);
+        if (!reader_read_chunk(j, o, bounce, chunk)) {
+            return false;
+        }
+        uint32_t pos = 0;
+        while (pos < chunk && si < j->nseg) {
+            const struct DmaSeg *g = &j->seg[si];
+            const uint32_t avail = g->len - so;
+            const uint32_t take = (chunk - pos) < avail ? (chunk - pos) : avail;
+            memcpy(g->host + so, bounce + pos, take);
+            pos += take;
+            so += take;
+            if (so == g->len) {
+                si++;
+                so = 0;
+            }
+        }
+        o += chunk;
+        left -= chunk;
+    }
+    return true;
+}
+
 static void *reader_thread(void *arg)
 {
     pthread_mutex_lock(&g_reader.mu);
@@ -764,14 +906,7 @@ static void *reader_thread(void *arg)
             nc_vm_dma.wait(j.gpu);
         }
         errno = 0;
-        j.ok = true;
-        uint64_t o = j.off;
-        for (unsigned i = 0; j.ok && i < j.nseg; i++) {
-            const struct DmaSeg *g = &j.seg[i];
-            j.ok = j.fd >= 0 ? pread(j.fd, g->host, g->len, (off_t)o) == (ssize_t)g->len
-                             : nc_disc_read_file(j.disc, &j.file, o, g->host, g->len);
-            o += g->len;
-        }
+        j.ok = reader_read_job(&j);
         j.err = j.ok ? 0 : errno;
         if (j.dev_us) {
             drive_wait(due);
@@ -829,6 +964,11 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
                  .dev_us = dev_us, .iosb = a[4], .event = event, .apc = a[2], .apc_ctx = a[3],
                  .thread = k->current, .thread_id = k->current ? k->current->id : 0, .sync = sync};
     snprintf(j.path, sizeof(j.path), "%s", nf->path);
+    if (!a[2] && a[3]) {
+        enum NcObType type;
+        const uint32_t fo = nc_ob_lookup(k, a[0], &type);
+        j.port = fo && type == NC_OB_FILE ? nc_io_file_port(k, fo, &j.port_key) : 0;
+    }
     size_t segs = 0;
     for (unsigned r = 0; r < nrun; r++) {
         segs += run[r].len / NC_PAGE + 2;
@@ -923,6 +1063,8 @@ static void disc_read_done(NcKernel *k, const DiscJob *j)
         j->thread->state != NC_T_TERMINATED) {
         const NcApc apc = {.normal = j->apc, .ctx = j->apc_ctx, .a1 = j->iosb, .a2 = 0};
         nc_apc_queue(k, j->thread, &apc);
+    } else if (!j->apc && j->port) {
+        nc_kqueue_post(k, j->port, j->port_key, j->apc_ctx, st, n);
     }
 }
 
@@ -996,6 +1138,48 @@ static void regrow(NcFile *nf, uint64_t from, uint64_t to)
     close(old);
 }
 
+/* An overwrite just replaced the file at host (set_aside moved the old one
+ * out, nf has the new one): the other handles open on it follow it to the new
+ * file, each at its own position, as FATX's handles share one file. Left on
+ * the old one they read what was there before the overwrite, and what they
+ * wrote went to the side file and was gone at nf's close. Forza's saves open
+ * a file, then open it again to overwrite it. Their side files of earlier
+ * overwrites go: the bytes a growth brings back are nf's now. */
+static void follow_overwrite(const NcFile *nf, const char *host)
+{
+    unsigned moved = 0, failed = 0;
+    int err = 0;
+    for (int i = 0; i < MAX_FILES; i++) {
+        NcFile *o = &g_files[i];
+        if (o == nf || !o->used || o->kind != F_HOST || o->is_dir || o->fd < 0 || strcmp(o->host, host)) {
+            continue;
+        }
+        const int fd = open(host, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            failed++;
+            err = errno;
+            continue;
+        }
+        close(o->fd);           /* the old file's: nothing of it is kept */
+        o->fd = fd;
+        o->wrote = false;
+        if (o->old_path[0]) {
+            unlink(o->old_path);
+            o->old_path[0] = '\0';
+            o->old_size = 0;
+        }
+        g_fs_cache[i] = (struct FsCache){0};
+        moved++;
+    }
+    if (failed) {
+        nc_log("hakuX-native-io", "overwrite %s: %u other open handle(s) couldn't move to the new file: %s",
+               nf->path, failed, strerror(err));
+    }
+    if (moved && trace_io()) {
+        nc_log("hakuX-native-io", "overwrite %s: %u other open handle(s) moved to the new file", nf->path, moved);
+    }
+}
+
 /* name relative to a RootDirectory (ObjectAttributes, a rename's): \?? for
  * XAPI's DOS paths ("D:\x"), else an open directory's path. False when the
  * handle isn't a file's. */
@@ -1051,6 +1235,12 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
     NcFile *nf = NULL;
 
     if (dev == -2) {
+        /* A memory unit (a title driver's device): its file system isn't
+         * mounted here yet (iodrv.c, the USB storage carve-out). */
+        const uint32_t guest = nc_iodrv_guest_volume(k, path);
+        if (guest) {
+            return guest;
+        }
         /* No such object. As the object manager's lookup has it, a name
          * missing from an object directory (\, \??, \Device) is a missing
          * name, one under a missing component a missing path. Titles tell
@@ -1108,7 +1298,7 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
         char host[512];
         int exists = host_path(dev, rel, host, sizeof(host));
         if (exists < 0) {
-            if (g_trace_io) {
+            if (trace_io()) {
                 nc_log("hakuX-native-io", "open %s: path not found", path);
             }
             return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -1126,7 +1316,7 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
             return STATUS_OBJECT_NAME_COLLISION;
         }
         if (!exists && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE)) {
-            if (g_trace_io) {
+            if (trace_io()) {
                 nc_log("hakuX-native-io", "open %s: not found", path);
             }
             return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -1191,6 +1381,9 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
         snprintf(nf->old_path, sizeof(nf->old_path), "%s", old_path);
         nf->old_size = old_size;
         snprintf(nf->host, sizeof(nf->host), "%s", host);
+        if (old_path[0]) {
+            follow_overwrite(nf, host);
+        }
     }
     snprintf(nf->path, sizeof(nf->path), "%s", path);
     nf->async = !(options & FILE_SYNCHRONOUS_IO);
@@ -1198,8 +1391,12 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
     nf->can_write = (access & ACCESS_WRITES) != 0;
     nc_kernel_trace_trigger(path);
     *handle = file_handle(k, nf);
-    nc_log("hakuX-native-io", "open %s -> %s%s", path, nf->is_dir ? "dir " : "",
-           *info == 2 ? "(created)" : *info == 3 ? "(overwritten)" : *info == 0 ? "(superseded)" : "");
+    char which[16] = "";
+    if (trace_io()) {
+        snprintf(which, sizeof(which), " #%d", (int)(nf - g_files)); /* the traced reads' and writes' */
+    }
+    nc_log("hakuX-native-io", "open %s -> %s%s%s", path, nf->is_dir ? "dir " : "",
+           *info == 2 ? "(created)" : *info == 3 ? "(overwritten)" : *info == 0 ? "(superseded)" : "", which);
     return *handle ? NC_STATUS_SUCCESS : NC_STATUS_INSUFFICIENT_RESOURCES;
 }
 
@@ -1351,7 +1548,7 @@ static uint32_t io_finish(NcKernel *k, const NcFile *nf, const uint32_t *a, uint
         return st;
     }
     io_status(k, a[4], st, n);
-    complete(k, a);
+    complete(k, a, st, n);
     return pend && nf->async && (a[1] || a[2] || nf->kind == F_DISC) ? STATUS_PENDING : st;
 }
 
@@ -1429,11 +1626,16 @@ static bool runs_resident(NcKernel *k, const IoRun *run, unsigned nrun)
 
 /* NtReadFile's work for a buffer of runs (len bytes in all): a[] as
  * NtReadFile takes it, its Buffer and Length aside. */
+static bool port_refuses_apc(NcKernel *k, const uint32_t *a);
+
 static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned nrun, uint32_t len)
 {
     NcFile *nf = file_of(k, a[0]);
     if (!nf) {
         return NC_STATUS_INVALID_HANDLE;
+    }
+    if (port_refuses_apc(k, a)) {
+        return NC_STATUS_INVALID_PARAMETER;
     }
     const uint32_t va0 = nrun ? run[0].va : 0;
     const int raw = nf->kind == F_VOLUME && nf->partition == 0 ? 0
@@ -1451,7 +1653,7 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
             o += run[i].len;
         }
         io_moved(k, nf, a[7], off + len);
-        if (g_trace_io) {
+        if (trace_io()) {
             nc_log("hakuX-native-io", "read %s raw +%llx %u", nf->path, (unsigned long long)off, len);
         }
         return io_finish(k, nf, a, NC_STATUS_SUCCESS, len, true);
@@ -1489,9 +1691,9 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         if ((nf->kind == F_DISC || (nf->kind == F_HOST && nf->fd >= 0)) && later &&
             disc_read_later(k, nf, a, run, nrun, off, n, !async, dev_us)) {
             io_moved(k, nf, a[7], off + n);
-            if (g_trace_io) {
-                nc_log("hakuX-native-io", "read %s +%llx %u into %08x%s %s%s%s", nf->path, (unsigned long long)off,
-                       n, va0, nrun > 1 ? " (scattered)" : "", async ? "pending" : "waited for",
+            if (trace_io()) {
+                nc_log("hakuX-native-io", "read %s #%d +%llx %u into %08x%s %s%s%s", nf->path, (int)(nf - g_files),
+                       (unsigned long long)off, n, va0, nrun > 1 ? " (scattered)" : "", async ? "pending" : "waited for",
                        a[1] ? " event" : "", a[2] ? " apc" : "");
             }
             if (!async) {
@@ -1516,13 +1718,14 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         }
     }
     io_moved(k, nf, a[7], off + n);
-    if (g_trace_io) {
+    if (trace_io()) {
         uint8_t b[8] = {0};
         if (n >= 8 && run[0].len >= 8) {
             memcpy(b, nc_vm_host(k->vm, va0), 8);
         }
-        nc_log("hakuX-native-io", "read %s +%llx %u into %08x -> %08x n=%u%s%s [%02x%02x%02x%02x %02x%02x%02x%02x]",
-               nf->path, (unsigned long long)off, len, va0, st, n, a[1] ? " event" : "", a[2] ? " apc" : "",
+        nc_log("hakuX-native-io", "read %s #%d +%llx %u into %08x -> %08x n=%u%s%s [%02x%02x%02x%02x %02x%02x%02x%02x]",
+               nf->path, (int)(nf - g_files), (unsigned long long)off, len, va0, st, n, a[1] ? " event" : "",
+               a[2] ? " apc" : "",
                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
     }
     return io_finish(k, nf, a, st, n, async);
@@ -1621,45 +1824,38 @@ static bool handle_can_write(const NcFile *nf, const char *what)
     return false;
 }
 
-/* NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset) */
-static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
+/* NtWriteFile's work for len bytes at src (host memory: the guest's buffer,
+ * or the pages NtWriteFileGather gathered); a[] as NtWriteFile takes it, its
+ * Buffer (a[5]) only logged. */
+static uint64_t write_from(NcKernel *k, const uint32_t *a, NcFile *nf, uint8_t *src, uint32_t len)
 {
-    NcFile *nf = file_of(k, a[0]);
-    if (!nf) {
-        return NC_STATUS_INVALID_HANDLE;
-    }
-    if (!nc_kernel_resident(k, a[5], a[6], false)) {
-        return 0;
-    }
     if (nf->kind == F_VOLUME) {
         if (nf->partition == 0) {
             const uint64_t off = io_offset(k, nf, a[7]);
-            nc_vm_will_read(a[5], a[6]);
-            raw_io(0, off, nc_vm_host(k->vm, a[5]), a[6], true);
-            io_moved(k, nf, a[7], off + a[6]);
-            if (g_trace_io) {
-                nc_log("hakuX-native-io", "write %s raw +%llx %u", nf->path, (unsigned long long)off, a[6]);
+            raw_io(0, off, src, len, true);
+            io_moved(k, nf, a[7], off + len);
+            if (trace_io()) {
+                nc_log("hakuX-native-io", "write %s raw +%llx %u", nf->path, (unsigned long long)off, len);
             }
         }
-        return io_finish(k, nf, a, NC_STATUS_SUCCESS, a[6], true);
+        return io_finish(k, nf, a, NC_STATUS_SUCCESS, len, true);
     }
     if (nf->kind == F_HOST && nf->is_dir && partition_root(nf) >= 3) {
         /* A cache drive formatted raw (XMountUtilityDrive): the superblock
          * write empties the folder; the head of the partition is kept. */
         const uint64_t o = io_offset(k, nf, a[7]);
-        io_moved(k, nf, a[7], o + a[6]);
-        nc_vm_will_read(a[5], a[6]);
-        raw_io(partition_root(nf), o, nc_vm_host(k->vm, a[5]), a[6], true);
+        io_moved(k, nf, a[7], o + len);
+        raw_io(partition_root(nf), o, src, len, true);
         /* The FATX superblock: "FATX", volume id, sectors per cluster. */
-        const uint8_t *sb = nc_vm_host(k->vm, a[5]);
-        if (o == 0 && a[6] >= 12 && !memcmp(sb, "FATX", 4)) {
+        const uint8_t *sb = src;
+        if (o == 0 && len >= 12 && !memcmp(sb, "FATX", 4)) {
             const int part = partition_root(nf);
             g_cluster_sectors[part] = nc_rd32(sb + 8);
             nc_log("hakuX-native-io", "%s formatted (%u-sector clusters): emptied %s", nf->path,
                    g_cluster_sectors[part], nf->host);
             remove_tree(nf->host, false);
         }
-        return io_finish(k, nf, a, NC_STATUS_SUCCESS, a[6], true);
+        return io_finish(k, nf, a, NC_STATUS_SUCCESS, len, true);
     }
     if (nf->kind != F_HOST || nf->is_dir || !handle_can_write(nf, "write to")) {
         io_status(k, a[4], STATUS_ACCESS_DENIED, 0);
@@ -1680,20 +1876,90 @@ static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
             regrow(nf, size, off); /* the gap a write past the end leaves */
         }
     }
-    nc_vm_will_read(a[5], a[6]);   /* pwrite from a page without access fails rather than faults */
-    ssize_t n = pwrite(nf->fd, nc_vm_host(k->vm, a[5]), a[6], (off_t)off);
-    uint32_t st = n == (ssize_t)a[6] ? NC_STATUS_SUCCESS : 0xC000007Fu; /* STATUS_DISK_FULL */
+    ssize_t n = pwrite(nf->fd, src, len, (off_t)off);
+    uint32_t st = n == (ssize_t)len ? NC_STATUS_SUCCESS : 0xC000007Fu; /* STATUS_DISK_FULL */
     nf->wrote |= n > 0;
-    if (g_trace_io) {
+    if (trace_io()) {
         uint8_t b[8] = {0};
         if (n >= 8) {
-            memcpy(b, nc_vm_host(k->vm, a[5]), 8);
+            memcpy(b, src, 8);
         }
-        nc_log("hakuX-native-io", "write %s +%llx %u from %08x -> %08x [%02x%02x%02x%02x %02x%02x%02x%02x]", nf->path,
-               (unsigned long long)off, a[6], a[5], st, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+        nc_log("hakuX-native-io", "write %s #%d +%llx %u from %08x -> %08x [%02x%02x%02x%02x %02x%02x%02x%02x]",
+               nf->path, (int)(nf - g_files), (unsigned long long)off, len, a[5], st, b[0], b[1], b[2], b[3], b[4],
+               b[5], b[6], b[7]);
     }
     io_moved(k, nf, a[7], off + (n > 0 ? (uint64_t)n : 0));
     return io_finish(k, nf, a, st, n > 0 ? (uint32_t)n : 0, nf->no_buffering);   /* cached: in the call */
+}
+
+/* A completion port takes the file's completions: no APC routine with it
+ * (NT refuses one, STATUS_INVALID_PARAMETER). */
+static bool port_refuses_apc(NcKernel *k, const uint32_t *a)
+{
+    if (!a[2]) {
+        return false;
+    }
+    enum NcObType type;
+    const uint32_t fo = nc_ob_lookup(k, a[0], &type);
+    uint32_t key;
+    return fo && type == NC_OB_FILE && nc_io_file_port(k, fo, &key);
+}
+
+/* NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset) */
+static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
+{
+    NcFile *nf = file_of(k, a[0]);
+    if (!nf) {
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    if (port_refuses_apc(k, a)) {
+        return NC_STATUS_INVALID_PARAMETER;
+    }
+    if (!nc_kernel_resident(k, a[5], a[6], false)) {
+        return 0;
+    }
+    nc_vm_will_read(a[5], a[6]);   /* pwrite from a page without access fails rather than faults */
+    return write_from(k, a, nf, nc_vm_host(k->vm, a[5]), a[6]);
+}
+
+/* NtWriteFileGather(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, SegmentArray,
+ * Length, ByteOffset): NtWriteFile from pages, SegmentArray holding a page's
+ * address (FILE_SEGMENT_ELEMENT, 4 bytes on the Xbox) for each page of
+ * Length, whole pages from each (the address's offset in its page left out),
+ * as NtReadFileScatter reads them. XAPI's WriteFileGather. */
+static uint64_t NtWriteFileGather(NcKernel *k, NcFrame *f, const uint32_t *a)
+{
+    NcFile *nf = file_of(k, a[0]);
+    if (!nf) {
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    if (port_refuses_apc(k, a)) {
+        return NC_STATUS_INVALID_PARAMETER;
+    }
+    const uint32_t len = a[6], pages = (uint32_t)(((uint64_t)len + NC_PAGE - 1) / NC_PAGE);
+    if (!nc_kernel_resident(k, a[5], pages * 4, false)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < pages; i++) {
+        const uint32_t va = nc_vm_rd32(k->vm, a[5] + 4 * i) & ~(NC_PAGE - 1);
+        const uint32_t n = len - i * NC_PAGE < NC_PAGE ? len - i * NC_PAGE : NC_PAGE;
+        if (!nc_kernel_resident(k, va, n, false)) {
+            return 0;
+        }
+    }
+    uint8_t *data = malloc(len ? len : 1);
+    if (!data) {
+        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    }
+    for (uint32_t i = 0; i < pages; i++) {
+        const uint32_t va = nc_vm_rd32(k->vm, a[5] + 4 * i) & ~(NC_PAGE - 1);
+        const uint32_t n = len - i * NC_PAGE < NC_PAGE ? len - i * NC_PAGE : NC_PAGE;
+        nc_vm_will_read(va, n);
+        memcpy(data + (size_t)i * NC_PAGE, nc_vm_host(k->vm, va), n);
+    }
+    const uint64_t r = write_from(k, a, nf, data, len);
+    free(data);
+    return r;
 }
 
 /* ---------------------------------------------------------- information */
@@ -1745,18 +2011,16 @@ static void network_open_info(const NcFile *nf, uint8_t *o)
     nc_wr32(o + 0x30, attrs);
 }
 
-/* NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass) */
-static uint64_t NtQueryInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
+/* A file information class of nf into buf (cap bytes); *len_out the bytes
+ * the class takes. */
+static uint32_t query_info(NcKernel *k, NcFile *nf, uint32_t cls, uint32_t buf, uint32_t cap, uint32_t *len_out)
 {
-    NcFile *nf = file_of(k, a[0]);
-    if (!nf) {
-        return NC_STATUS_INVALID_HANDLE;
-    }
     uint8_t o[0x38];                    /* the largest class's; the caller's buffer once it fits */
     uint64_t t[4], size;
     uint32_t attrs, len;
     file_facts(nf, t, &size, &attrs);
-    switch (a[4]) {
+    *len_out = 0;
+    switch (cls) {
     case 4: /* FileBasicInformation: times, FileAttributes */
         len = 0x28;
         memset(o, 0, len);
@@ -1801,15 +2065,61 @@ static uint64_t NtQueryInformationFile(NcKernel *k, NcFrame *f, const uint32_t *
         nc_wr32(o, 0);
         break;
     default:
-        nc_log("hakuX-native-io", "query information class %u on %s not implemented", a[4], nf->path);
-        io_status(k, a[1], 0xC0000003u, 0); /* STATUS_INVALID_INFO_CLASS */
-        return 0xC0000003u;
+        nc_log("hakuX-native-io", "query information class %u on %s not implemented", cls, nf->path);
+        return 0xC0000003u; /* STATUS_INVALID_INFO_CLASS */
     }
-    if (a[3] < len) {
+    *len_out = len;
+    if (cap < len) {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    memcpy(nc_vm_host(k->vm, a[2]), o, len);
-    io_status(k, a[1], NC_STATUS_SUCCESS, len);
+    memcpy(nc_vm_host(k->vm, buf), o, len);
+    return NC_STATUS_SUCCESS;
+}
+
+/* NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass) */
+static uint64_t NtQueryInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
+{
+    NcFile *nf = file_of(k, a[0]);
+    if (!nf) {
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    uint32_t len;
+    const uint32_t st = query_info(k, nf, a[4], a[2], a[3], &len);
+    if (st == NC_STATUS_SUCCESS) {
+        io_status(k, a[1], st, len);
+    } else if (st != STATUS_BUFFER_TOO_SMALL) {
+        io_status(k, a[1], st, 0);
+    }
+    return st;
+}
+
+/* The file's completions go to the port as packets with the key (a file has
+ * one port for good, as on NT). */
+static uint32_t set_completion(NcKernel *k, uint32_t file, uint32_t port_handle, uint32_t key)
+{
+    enum NcObType type;
+    const uint32_t fo = nc_ob_lookup(k, file, &type);
+    if (!fo || type != NC_OB_FILE) {
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    const uint32_t port = nc_ob_lookup(k, port_handle, &type);
+    if (!port || type != NC_OB_IOCOMPLETION) {
+        return port ? NC_STATUS_OBJECT_TYPE_MISMATCH : NC_STATUS_INVALID_HANDLE;
+    }
+    if (nc_vm_rd32(k->vm, fo + FO_COMPLETION)) {
+        return NC_STATUS_INVALID_PARAMETER;
+    }
+    const uint32_t cc = nc_pool_alloc(k, CC_BYTES);
+    if (!cc) {
+        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    }
+    nc_vm_wr32(k->vm, cc + CC_PORT, port);
+    nc_vm_wr32(k->vm, cc + CC_KEY, key);
+    nc_ob_reference(k, port, 1);
+    nc_vm_wr32(k->vm, fo + FO_COMPLETION, cc);
+    if (trace_io()) {
+        nc_log("hakuX-native-io", "file handle %08x: completions to port %08x, key %08x", file, port, key);
+    }
     return NC_STATUS_SUCCESS;
 }
 
@@ -1915,6 +2225,9 @@ static uint64_t NtSetInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
         }
         break;
     }
+    case 30: /* FileCompletionInformation: Port (a handle), Key: XAPI's CreateIoCompletionPort */
+        st = set_completion(k, a[0], nc_rd32(in), nc_rd32(in + 4));
+        break;
     default:
         nc_log("hakuX-native-io", "set information class %u on %s not implemented", a[4], nf->path);
         st = 0xC0000003u;
@@ -2241,7 +2554,7 @@ static uint64_t NtQueryDirectoryFile(NcKernel *k, NcFrame *f, const uint32_t *a)
         i++;
     }
     uint32_t st;
-    if (g_trace_io) {
+    if (trace_io()) {
         nc_log("hakuX-native-io", "list %s mask '%s' (%u entries): %s", nf->path, nf->mask, n,
                i < n ? entries[i].name : "no more");
     }
@@ -2252,7 +2565,7 @@ static uint64_t NtQueryDirectoryFile(NcKernel *k, NcFrame *f, const uint32_t *a)
             nc_log("hakuX-native-io", "list %s mask '%s': nothing matches (%u entries)", nf->path, nf->mask, n);
         }
         io_status(k, a[4], st, 0);
-        complete(k, a);
+        complete(k, a, st, 0);
         return st;
     }
     nf->dir_next = i + 1;
@@ -2273,7 +2586,7 @@ static uint64_t NtQueryDirectoryFile(NcKernel *k, NcFrame *f, const uint32_t *a)
     nc_wr32(o + 0x3C, nlen);
     memcpy(o + 0x40, e->name, nlen);
     io_status(k, a[4], NC_STATUS_SUCCESS, 0x40 + nlen);
-    complete(k, a);
+    complete(k, a, NC_STATUS_SUCCESS, 0x40 + nlen);
     return NC_STATUS_SUCCESS;
 }
 
@@ -2382,9 +2695,54 @@ static uint32_t disk_ioctl(const NcFile *nf, uint32_t code, uint8_t *out, uint32
  * Cdb +0x1C). XAPI checks the disc with MODE SENSE(10) of the Xbox security
  * page (0x3E, the DVDX2 authentication page) and reboots to the dashboard
  * unless the drive reports the Xbox partition authenticated (Panzer Dragoon
- * Orta, XDK 4928): CDFValid, PartitionArea 1, Authentication. Other commands
+ * Orta, XDK 4928): CDFValid, PartitionArea 1, Authentication. The security
+ * sector is built and signed here (security_sector, below). Other commands
  * read zeros. */
 #define IOCTL_SCSI_PASS_THROUGH_DIRECT 0x4D014u
+
+/* READ DVD STRUCTURE of the security sector: format 0 at address 0xFF02FDFF,
+ * layer 0xFE, as XAPI's media check reads it in titles whose certificate
+ * sets security flag bit 0 (Midtown Madness 3; docs/research/
+ * 2026-11-15-security-sector-check.md). */
+static bool security_sector_read(const uint8_t *cdb)
+{
+    return cdb[0] == 0xAD && cdb[2] == 0xFF && cdb[3] == 0x02 && cdb[4] == 0xFD && cdb[5] == 0xFF &&
+           cdb[6] == 0xFE && cdb[7] == 0x00;
+}
+
+/* The reply: READ DVD STRUCTURE's 4-byte header (the length past its first 2
+ * bytes, big-endian), then the sector, built for the running title's
+ * certificate (the XBE header mapped at 0x10000) and signed with HakuXP's key,
+ * which the kernel exports as XePublicKeyData. Built once per certificate. */
+static void security_sector(NcKernel *k, uint8_t *d, uint32_t n)
+{
+    static uint8_t ss[NC_SS_LEN];
+    static uint32_t ss_time;
+    static bool ss_built;
+    uint32_t time = 0;
+    if (nc_vm_rd32(k->vm, 0x10000) == 0x48454258u) { /* "XBEH" */
+        time = nc_vm_rd32(k->vm, nc_vm_rd32(k->vm, 0x10118) + 4);
+    }
+    if (!ss_built || ss_time != time) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        nc_ss_build(ss, time);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ss_time = time;
+        ss_built = true;
+        nc_log("hakuX-native-io", "scsi ad: security sector for certificate time %08X, signed with "
+               "HakuXP's key in %ld ms", time,
+               (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+    }
+    const uint32_t len = NC_SS_LEN + 2;
+    d[0] = (uint8_t)(len >> 8);
+    if (n > 1) {
+        d[1] = (uint8_t)len;
+    }
+    if (n > 4) {
+        memcpy(d + 4, ss, n - 4 < NC_SS_LEN ? n - 4 : NC_SS_LEN);
+    }
+}
 
 static void scsi_pass_through(NcKernel *k, uint32_t sptd, uint32_t len)
 {
@@ -2406,8 +2764,22 @@ static void scsi_pass_through(NcKernel *k, uint32_t sptd, uint32_t len)
         d[10] = 1;                             /* CDFValid */
         d[11] = 1;                             /* PartitionArea: the Xbox partition */
         d[12] = 1;                             /* Authentication */
+    } else if (security_sector_read(cdb)) {
+        security_sector(k, d, n);
     } else {
-        nc_log("hakuX-native-io", "scsi %02x (%u bytes): zeros", cdb[0], n);
+        /* The whole CDB and the direction (DataIn at +8: 1 read from the
+         * drive): READ DVD STRUCTURE (0xAD) names its format in byte 7, for
+         * one. Titles leave CdbLength (+6) at 0 (Midtown Madness 3's XAPI),
+         * so a 0 there shows ATAPI's 12 bytes. */
+        const uint8_t cdb_len = *(const uint8_t *)nc_vm_host(k->vm, sptd + 6);
+        const uint8_t in = *(const uint8_t *)nc_vm_host(k->vm, sptd + 8);
+        const unsigned shown = cdb_len == 0 ? 12u : cdb_len < 16 ? cdb_len : 16u;
+        char hex[16 * 3 + 1] = "";
+        for (unsigned i = 0; i < shown; i++) {
+            snprintf(hex + i * 3, 4, "%02x ", cdb[i]);
+        }
+        nc_log("hakuX-native-io", "scsi %02x (%u bytes, %s): zeros; cdb %s", cdb[0], n,
+               in == 1 ? "in" : in == 0 ? "out" : "none", hex);
     }
 }
 
@@ -2445,22 +2817,8 @@ static uint64_t NtControlFile(NcKernel *k, NcFrame *f, const uint32_t *a)
         status = STATUS_INVALID_DEVICE_REQUEST;
     }
     io_status(k, a[4], status, info);
-    complete(k, a);
+    complete(k, a, status, info);
     return status;
-}
-
-/* IoSynchronousDeviceIoControlRequest(IoControlCode, DeviceObject, InputBuffer, InputBufferLength,
- *   OutputBuffer, OutputBufferLength, ReturnedOutputBufferLength, InternalDeviceIoControl) */
-static uint64_t IoSynchronousDeviceIoControlRequest(NcKernel *k, NcFrame *f, const uint32_t *a)
-{
-    nc_log("hakuX-native-io", "device control %08x on device %08x (out %u)", a[0], a[1], a[5]);
-    if (a[4] && a[5]) {
-        memset(nc_vm_host(k->vm, a[4]), 0, a[5]);
-    }
-    if (a[6]) {
-        nc_vm_wr32(k->vm, a[6], 0);
-    }
-    return NC_STATUS_SUCCESS;
 }
 
 /* -------------------------------------------------------- symbolic links */
@@ -2490,24 +2848,25 @@ static uint64_t IoDeleteSymbolicLink(NcKernel *k, NcFrame *f, const uint32_t *a)
     return NC_STATUS_SUCCESS;
 }
 
-/* NtOpenSymbolicLinkObject(LinkHandle, ObjectAttributes) */
+uint32_t nc_io_open_link(NcKernel *k, const char *name, uint32_t *handle);
+
+/* NtOpenSymbolicLinkObject(LinkHandle, ObjectAttributes): its name under its
+ * RootDirectory (ObDosDevicesDirectory: "D:") */
 static uint64_t NtOpenSymbolicLinkObject(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    char name[64];
-    ansi(k, nc_vm_rd32(k->vm, a[1] + 4), name, sizeof(name));
-    int i = link_find(name);
-    if (i < 0) {
+    char name[256];
+    if (!nc_obname_path(k, a[1], name, sizeof(name))) {
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    uint32_t h = 0;
+    const uint32_t st = nc_io_open_link(k, name, &h);
+    if (st == STATUS_OBJECT_NAME_NOT_FOUND) {
         nc_log("hakuX-native-io", "symbolic link %s: none", name);
-        return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    NcFile *nf = file_new();
-    if (!nf) {
-        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    if (st == NC_STATUS_SUCCESS) {
+        nc_vm_wr32(k->vm, a[0], h);
     }
-    nf->kind = F_LINK;
-    snprintf(nf->path, sizeof(nf->path), "%s", g_links[i].target);
-    nc_vm_wr32(k->vm, a[0], file_handle(k, nf));
-    return NC_STATUS_SUCCESS;
+    return st;
 }
 
 /* NtQuerySymbolicLinkObject(LinkHandle, LinkTarget (ANSI_STRING), ReturnedLength) */
@@ -2530,139 +2889,97 @@ static uint64_t NtQuerySymbolicLinkObject(NcKernel *k, NcFrame *f, const uint32_
     return NC_STATUS_SUCCESS;
 }
 
-/* ------------------------------------------------------- device objects */
+/* ------------------------------------------- for the I/O manager's modules */
 
-/* DEVICE_OBJECT (nxdk xboxkrnl.h, CC0): Type 0x00, Size 0x02, ReferenceCount
- * 0x04, DriverObject 0x08, MountedOrSelfDevice 0x0C, CurrentIrp 0x10, Flags
- * 0x14, DeviceExtension 0x18, DeviceType 0x1C, StartIoFlags 0x1D, StackSize
- * 0x1E, DeletePending 0x1F, SectorSize 0x20, AlignmentRequirement 0x24,
- * DeviceQueue 0x28 (KDEVICE_QUEUE: Type, Size, Busy, DeviceListHead),
- * DeviceLock 0x34 (KEVENT), StartIoKey 0x44; 0x48 bytes, the extension after it. */
-#define DEVOBJ_SIZE     0x48u
-#define DO_DEVICE_INITIALIZING 0x80u
-
-static struct {
-    char name[64];
-    uint32_t object;
-} g_devices[32];
-
-static uint32_t device_named(const char *path)
+bool nc_io_canon(const char *in, char *out, size_t cap)
 {
-    for (int i = 0; i < 32; i++) {
-        if (g_devices[i].object && !strcasecmp(g_devices[i].name, path)) {
-            return g_devices[i].object;
-        }
-    }
-    return 0;
+    return canon(in, out, cap);
 }
 
-static void device_add(const char *path, uint32_t object)
+void nc_io_ansi(NcKernel *k, uint32_t str, char *out, size_t cap)
 {
-    for (int i = 0; i < 32; i++) {
-        if (!g_devices[i].object) {
-            snprintf(g_devices[i].name, sizeof(g_devices[i].name), "%s", path);
-            g_devices[i].object = object;
-            return;
-        }
-    }
-    nc_log("hakuX-native-io", "device table full: %s not named", path);
+    ansi(k, str, out, cap);
 }
 
-static uint32_t device_new(NcKernel *k, uint32_t driver, uint32_t ext_size, uint32_t type)
+void nc_io_raw(int part, uint64_t off, uint8_t *buf, uint32_t len, bool write)
 {
-    const uint32_t ext = nc_align_up(ext_size, 16);
-    const uint32_t d = nc_ob_create(k, NC_OB_DEVICE, DEVOBJ_SIZE + ext);
-    if (!d) {
-        return 0;
-    }
-    uint8_t *p = nc_vm_host(k->vm, d);
-    *(uint16_t *)p = 3; /* IO_TYPE_DEVICE */
-    *(uint16_t *)(p + 2) = (uint16_t)(DEVOBJ_SIZE + ext);
-    nc_vm_wr32(k->vm, d + 0x08, driver);
-    nc_vm_wr32(k->vm, d + 0x14, DO_DEVICE_INITIALIZING);
-    nc_vm_wr32(k->vm, d + 0x18, ext_size ? d + DEVOBJ_SIZE : 0);
-    p[0x1C] = (uint8_t)type;
-    p[0x1E] = 1; /* StackSize */
-    nc_vm_wr32(k->vm, d + 0x24, 0);
-    *(int16_t *)(p + 0x28) = 0x14;      /* DeviceQueueObject */
-    p[0x2A] = 0x0C / 4;
-    nc_vm_wr32(k->vm, d + 0x2C, d + 0x2C);
-    nc_vm_wr32(k->vm, d + 0x30, d + 0x2C);
-    p[0x34] = 1;                        /* DeviceLock: synchronization event, signaled */
-    p[0x36] = 4;
-    nc_vm_wr32(k->vm, d + 0x38, 1);
-    nc_vm_wr32(k->vm, d + 0x3C, d + 0x3C);
-    nc_vm_wr32(k->vm, d + 0x40, d + 0x3C);
-    return d;
+    raw_io(part, off, buf, len, write);
 }
 
-/* IoCreateDevice(DriverObject, DeviceExtensionSize, DeviceName, DeviceType, Exclusive, DeviceObject) */
-static uint64_t IoCreateDevice(NcKernel *k, NcFrame *f, const uint32_t *a)
+bool nc_io_partition(int part, uint64_t *off, uint64_t *len)
 {
-    char name[128] = "", path[256] = "";
-    if (a[2]) {
-        ansi(k, a[2], name, sizeof(name));
-        if (!canon(name, path, sizeof(path))) {
-            return STATUS_OBJECT_PATH_NOT_FOUND;
-        }
-        if (device_named(path)) {
-            return STATUS_OBJECT_NAME_COLLISION;
-        }
+    if (part < 0 || part > 5) {
+        return false;
     }
-    const uint32_t d = device_new(k, a[0], a[1], a[3]);
-    if (!d) {
-        return NC_STATUS_INSUFFICIENT_RESOURCES;
-    }
-    if (path[0]) {
-        device_add(path, d);
-    }
-    nc_vm_wr32(k->vm, a[5], d);
-    nc_log("hakuX-native-io", "device %s created: type %02x, driver %08x, extension %u", path[0] ? path : "(unnamed)",
-           a[3], a[0], a[1]);
-    return NC_STATUS_SUCCESS;
+    *off = k_partitions[part][0];
+    *len = part ? k_partitions[part][1] : HDD_BYTES; /* Partition0 is the whole disk */
+    return true;
 }
 
-/* IoDeleteDevice(DeviceObject) */
-static uint64_t IoDeleteDevice(NcKernel *k, NcFrame *f, const uint32_t *a)
+void nc_io_scsi(NcKernel *k, uint32_t sptd, uint32_t len)
 {
-    for (int i = 0; i < 32; i++) {
-        if (g_devices[i].object == a[0]) {
-            g_devices[i].object = 0;
-        }
-    }
-    *((uint8_t *)nc_vm_host(k->vm, a[0]) + 0x1F) = 1; /* DeletePending */
-    return 0;
+    scsi_pass_through(k, sptd, len);
 }
 
-/* ObReferenceObjectByName(ObjectName, Attributes, ObjectType, ParseContext, Object): devices only.
- * Created devices by name; the built-in disc and partitions on first reference. */
-static uint64_t ObReferenceObjectByName(NcKernel *k, NcFrame *f, const uint32_t *a)
+void nc_io_links_each(void (*fn)(void *ctx, const char *name), void *ctx)
 {
-    char name[512], path[512];
-    ansi(k, a[0], name, sizeof(name));
-    const char *rel;
-    if (!canon(name, path, sizeof(path))) {
+    for (int i = 0; i < MAX_LINKS; i++) {
+        if (g_links[i].name[0]) {
+            fn(ctx, g_links[i].name);
+        }
+    }
+}
+
+uint32_t nc_io_open_link(NcKernel *k, const char *name, uint32_t *handle)
+{
+    const int i = link_find(name);
+    if (i < 0) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    uint32_t d = device_named(path);
-    if (!d) {
-        if (device_of(path, &rel) == -2 || *rel) {
-            nc_log("hakuX-native-io", "reference by name %s: not found", name);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        d = device_new(k, 0, 0, device_of(path, &rel) == -1 ? 0x02 : 0x07);
-        if (!d) {
-            return NC_STATUS_INSUFFICIENT_RESOURCES;
-        }
-        device_add(path, d);
+    NcFile *nf = file_new();
+    if (!nf) {
+        return NC_STATUS_INSUFFICIENT_RESOURCES;
     }
-    nc_vm_wr32(k->vm, a[4], d);
+    nf->kind = F_LINK;
+    snprintf(nf->path, sizeof(nf->path), "%s", g_links[i].target);
+    *handle = file_handle(k, nf);
+    if (!*handle) {
+        nf->used = false;
+        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    }
     return NC_STATUS_SUCCESS;
+}
+
+/* IoCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
+ *   FileAttributes, ShareAccess, CreateDisposition, CreateOptions, Options): NtCreateFile's
+ * open (Options, the I/O manager's own flags, change nothing here) */
+static uint64_t IoCreateFile(NcKernel *k, NcFrame *f, const uint32_t *a)
+{
+    return NtCreateFile(k, f, a);
+}
+
+/* IoQueryFileInformation(FileObject, FileInformationClass, Length, FileInformation,
+ *   ReturnedLength): NtQueryInformationFile's on a file object */
+static uint64_t IoQueryFileInformation(NcKernel *k, NcFrame *f, const uint32_t *a)
+{
+    if (!a[0] || nc_rd16(nc_vm_host(k->vm, a[0])) != 5) { /* IO_TYPE_FILE */
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    const uint32_t i = nc_vm_rd32(k->vm, a[0] + FO_INDEX);
+    if (i >= MAX_FILES || !g_files[i].used) {
+        return NC_STATUS_INVALID_HANDLE;
+    }
+    uint32_t len = 0;
+    const uint32_t st = query_info(k, &g_files[i], a[1], a[3], a[2], &len);
+    if (a[4]) {
+        nc_vm_wr32(k->vm, a[4], st == NC_STATUS_SUCCESS ? len : 0);
+    }
+    return st;
 }
 
 void nc_io_register(NcKernel *k)
 {
-    g_trace_io = getenv("NC_TRACE_IO") != NULL;
+    __atomic_store_n(&g_trace_io, getenv("NC_TRACE_IO") != NULL, __ATOMIC_RELAXED); /* off unless asked for */
     link_set("\\??\\D:", "\\Device\\CdRom0");
     link_set("\\??\\CdRom0:", "\\Device\\CdRom0");     /* the kernel's own, as on the Xbox (the dashboard's) */
     nc_kernel_impl(k, "ExReadWriteRefurbInfo", ExReadWriteRefurbInfo);
@@ -2673,6 +2990,9 @@ void nc_io_register(NcKernel *k)
     nc_kernel_impl(k, "NtReadFile", NtReadFile);
     nc_kernel_impl(k, "NtReadFileScatter", NtReadFileScatter);
     nc_kernel_impl(k, "NtWriteFile", NtWriteFile);
+    nc_kernel_impl(k, "NtWriteFileGather", NtWriteFileGather);
+    nc_kernel_impl(k, "IoCreateFile", IoCreateFile);
+    nc_kernel_impl(k, "IoQueryFileInformation", IoQueryFileInformation);
     nc_kernel_impl(k, "NtQueryInformationFile", NtQueryInformationFile);
     nc_kernel_impl(k, "NtSetInformationFile", NtSetInformationFile);
     nc_kernel_impl(k, "NtQueryVolumeInformationFile", NtQueryVolumeInformationFile);
@@ -2683,14 +3003,10 @@ void nc_io_register(NcKernel *k)
     nc_kernel_impl(k, "NtFlushBuffersFile", NtFlushBuffersFile);
     nc_kernel_impl(k, "NtFsControlFile", NtControlFile);
     nc_kernel_impl(k, "NtDeviceIoControlFile", NtControlFile);
-    nc_kernel_impl(k, "IoSynchronousDeviceIoControlRequest", IoSynchronousDeviceIoControlRequest);
     nc_kernel_impl(k, "IoCreateSymbolicLink", IoCreateSymbolicLink);
     nc_kernel_impl(k, "IoDeleteSymbolicLink", IoDeleteSymbolicLink);
     nc_kernel_impl(k, "NtOpenSymbolicLinkObject", NtOpenSymbolicLinkObject);
     nc_kernel_impl(k, "NtQuerySymbolicLinkObject", NtQuerySymbolicLinkObject);
-    nc_kernel_impl(k, "ObReferenceObjectByName", ObReferenceObjectByName);
-    nc_kernel_impl(k, "IoCreateDevice", IoCreateDevice);
-    nc_kernel_impl(k, "IoDeleteDevice", IoDeleteDevice);
 }
 
 /* ---------------------------------------------------------- savestates */

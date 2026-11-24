@@ -73,11 +73,29 @@ bool nc_kern_state_save(NcBuf *b)
     return true;
 }
 
+static bool g_loaded_clock;
+static uint64_t g_loaded_ns, g_loaded_cycles;
+
+bool nc_kern_state_loaded_clock(uint64_t *since_boot_ns, uint64_t *guest_cycles)
+{
+    if (!g_loaded_clock) {
+        return false;
+    }
+    *since_boot_ns = g_loaded_ns;
+    *guest_cycles = g_loaded_cycles;
+    return true;
+}
+
 bool nc_kern_state_load(NcRd *r, unsigned v)
 {
     NcKernel *k = nc_state_kernel();
     const uint32_t base = k->xbe_base, size = k->xbe_size, kprocess = k->kprocess;
+    uint64_t ec;
+    const bool have_ec = nc_log_count(&ec);  /* the state's call total isn't the log's EC */
     nc_rec_get(r, &nc_rec_NcKernel, k, v);
+    if (have_ec) {
+        nc_log_count_continue(ec);
+    }
     if (v < 2) {
         memset(k->handles_more, 0, sizeof(k->handles_more));    /* its table ended at NC_HANDLES_V1 */
     }
@@ -93,8 +111,12 @@ bool nc_kern_state_load(NcRd *r, unsigned v)
         return false;
     }
     k->nstack_free = 0;                 /* the boot's slots given back, not the state's */
+    nc_kernel_stubs_restore(k);         /* the RAM's kernel area is the saving build's */
     nc_ke_state_set(s.boot_ns, s.time_offset, s.guest_ns);
     nc_cpu_guest_cycles_set(k->cpu, s.guest_cycles);
+    g_loaded_clock = true;              /* a playbook's clock starts from these (detclock.h) */
+    g_loaded_ns = s.guest_ns - s.boot_ns;
+    g_loaded_cycles = s.guest_cycles;
     if (s.x87_single) {
         nc_cpu_x87_single_restore(k->cpu);
     }

@@ -17,7 +17,7 @@
  * dispatched when the scheduler runs below DISPATCH_LEVEL, so they don't
  * interrupt guest code between kernel calls yet.
  */
-#include "native/kernel/kernel.h"
+#include "native/kernel/iomgr.h"
 #include "hw/xbox/hle/host.h"
 
 #define KT_INSERTED 0x03
@@ -385,13 +385,20 @@ static uint64_t KeCancelTimer(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtCreateTimer(TimerHandle, ObjectAttributes, TimerType) */
 static uint64_t NtCreateTimer(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    uint32_t timer = nc_ob_create(k, NC_OB_TIMER, KTIMER_SIZE);
-    if (!timer) {
-        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    char path[256];
+    uint32_t timer, st;
+    const int named = nc_obname_precreate(k, a[1], NC_OB_TIMER, path, sizeof(path), &timer, &st);
+    if (named < 0) {
+        return st;
     }
-    timer_init(k, timer, a[2]);
-    nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, timer, NC_OB_TIMER));
-    return NC_STATUS_SUCCESS;
+    if (!named) {
+        timer = nc_ob_create(k, NC_OB_TIMER, KTIMER_SIZE);
+        if (!timer) {
+            return NC_STATUS_INSUFFICIENT_RESOURCES;
+        }
+        timer_init(k, timer, a[2]);
+    }
+    return nc_obname_created(k, a[0], timer, NC_OB_TIMER, path, named, st);
 }
 
 static uint32_t timer_of(NcKernel *k, uint32_t handle)

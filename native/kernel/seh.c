@@ -38,27 +38,30 @@ enum { CONTINUE_EXECUTION, CONTINUE_SEARCH, NESTED_EXCEPTION, COLLIDED_UNWIND };
 
 /* CONTEXT, the Xbox's: FloatSave is the FXSAVE image plus Cr0NpxState; no
  * debug registers and no data segment registers. */
-#define CX_FLAGS  0x000
-#define CX_FCW    0x004
-#define CX_MXCSR  0x01C
-#define CX_EDI    0x208
-#define CX_ESI    0x20C
-#define CX_EBX    0x210
-#define CX_EDX    0x214
-#define CX_ECX    0x218
-#define CX_EAX    0x21C
-#define CX_EBP    0x220
-#define CX_EIP    0x224
-#define CX_CS     0x228
-#define CX_EFLAGS 0x22C
-#define CX_ESP    0x230
-#define CX_SS     0x234
-#define CX_SIZE   0x238
-#define CONTEXT_FULL 0x10007u /* control, integer, segments */
+#define CX_FLAGS     0x000
+#define CX_FLOATSAVE 0x004
+#define CX_FCW       0x004
+#define CX_MXCSR     0x01C
+#define CX_EDI       0x208
+#define CX_ESI       0x20C
+#define CX_EBX       0x210
+#define CX_EDX       0x214
+#define CX_ECX       0x218
+#define CX_EAX       0x21C
+#define CX_EBP       0x220
+#define CX_EIP       0x224
+#define CX_CS        0x228
+#define CX_EFLAGS    0x22C
+#define CX_ESP       0x230
+#define CX_SS        0x234
+#define CX_SIZE      0x238
+#define CONTEXT_FLOATING_POINT 0x00008u
+#define CONTEXT_FULL           0x10007u /* control, integer, segments */
 
-#define CHAIN_END     0xFFFFFFFFu
-#define STATUS_UNWIND 0xC0000027u
-#define CXX_EXCEPTION 0xE06D7363u /* MSVC's throw */
+#define CHAIN_END               0xFFFFFFFFu
+#define STATUS_ACCESS_VIOLATION 0xC0000005u
+#define STATUS_UNWIND           0xC0000027u
+#define CXX_EXCEPTION           0xE06D7363u /* MSVC's throw */
 
 /* A level's guest frame, from its base up:
  *   +0   return address, the SEH-return stub (ESP as the handler starts)
@@ -99,9 +102,8 @@ static void capture(NcKernel *k, NcFrame *f, uint32_t ctx, uint32_t eip, uint32_
 {
     uint8_t *c = nc_vm_host(k->vm, ctx);
     memset(c, 0, CX_SIZE);
-    nc_wr32(c + CX_FLAGS, CONTEXT_FULL);
-    nc_wr16(c + CX_FCW, 0x027F);
-    nc_wr32(c + CX_MXCSR, 0x1F80);
+    nc_wr32(c + CX_FLAGS, CONTEXT_FULL | CONTEXT_FLOATING_POINT);
+    nc_frame_fxsave(f, c + CX_FLOATSAVE);
     nc_wr32(c + CX_EDI, nc_frame_gpr(f, NC_EDI));
     nc_wr32(c + CX_ESI, nc_frame_gpr(f, NC_ESI));
     nc_wr32(c + CX_EBX, nc_frame_gpr(f, NC_EBX));
@@ -116,9 +118,12 @@ static void capture(NcKernel *k, NcFrame *f, uint32_t ctx, uint32_t eip, uint32_
     nc_wr32(c + CX_SS, 0x10);
 }
 
-/* NtContinue: the guest runs on from the CONTEXT's control and integer registers. */
+/* NtContinue: the guest runs on from the CONTEXT's control, integer and FP registers. */
 static void resume(NcKernel *k, NcFrame *f, uint32_t ctx)
 {
+    if (rd(k, ctx + CX_FLAGS) & CONTEXT_FLOATING_POINT) {
+        nc_frame_fxrstor(f, nc_vm_host(k->vm, ctx + CX_FLOATSAVE));
+    }
     static const struct {
         int reg;
         uint32_t off;
@@ -200,12 +205,53 @@ static NcSeh *push_level(NcKernel *k, NcFrame *f, NcThread *t, uint32_t esp)
     return l;
 }
 
+/* Snapshots the original faulting CONTEXT from l->ctx into k->stop_info. */
+static void capture_seh_stop(NcKernel *k, const NcSeh *l, uint32_t code, uint32_t addr,
+                             bool has_fault, bool fault_write, uint32_t fault_va)
+{
+    memset(&k->stop_info, 0, sizeof(k->stop_info));
+    k->stop_info.valid = true;
+    k->stop_info.has_fault = has_fault;
+    k->stop_info.fault_write = fault_write;
+    k->stop_info.fault_va = fault_va;
+    k->stop_info.exception_code = code;
+    k->stop_info.thread_id = k->current ? k->current->id : 0;
+    k->stop_info.eip = addr;
+    if (nc_vm_phys(k->vm, l->ctx) != UINT32_MAX && nc_vm_phys(k->vm, l->ctx + CX_SIZE - 4) != UINT32_MAX) {
+        k->stop_info.gpr[NC_EAX] = rd(k, l->ctx + CX_EAX);
+        k->stop_info.gpr[NC_ECX] = rd(k, l->ctx + CX_ECX);
+        k->stop_info.gpr[NC_EDX] = rd(k, l->ctx + CX_EDX);
+        k->stop_info.gpr[NC_EBX] = rd(k, l->ctx + CX_EBX);
+        k->stop_info.gpr[NC_ESP] = rd(k, l->ctx + CX_ESP);
+        k->stop_info.gpr[NC_EBP] = rd(k, l->ctx + CX_EBP);
+        k->stop_info.gpr[NC_ESI] = rd(k, l->ctx + CX_ESI);
+        k->stop_info.gpr[NC_EDI] = rd(k, l->ctx + CX_EDI);
+        k->stop_info.eip = rd(k, l->ctx + CX_EIP);
+        k->stop_info.eflags = rd(k, l->ctx + CX_EFLAGS);
+        k->stop_info.cs = (uint16_t)rd(k, l->ctx + CX_CS);
+        k->stop_info.ss = (uint16_t)rd(k, l->ctx + CX_SS);
+    }
+}
+
 static void unhandled(NcKernel *k, NcFrame *f, NcSeh *l, const char *why)
 {
+    const uint32_t code = rd(k, l->rec + ER_CODE);
+    const uint32_t addr = rd(k, l->rec + ER_ADDRESS);
+    if (code == STATUS_ACCESS_VIOLATION && rd(k, l->rec + ER_NPARAMS) >= 2) {
+        const bool write = rd(k, l->rec + ER_INFO) != 0;
+        const uint32_t va = rd(k, l->rec + ER_INFO + 4);
+        capture_seh_stop(k, l, code, addr, true, write, va);
+        nc_kernel_dump_recent(-1);
+        nc_kernel_dump_threads(k, -1);
+        nc_kernel_request_stop(k, f, "page fault at %08x from eip %08x (%s) not handled by the title (%s)",
+                               va, addr, write ? "write" : "read", why);
+        return;
+    }
+    capture_seh_stop(k, l, code, addr, false, false, 0);
     char type[96];
-    nc_kernel_request_stop(k, f, "seh: unhandled exception %08x at %08x (%s)%s%s", rd(k, l->rec + ER_CODE),
-                           rd(k, l->rec + ER_ADDRESS), why, rd(k, l->rec + ER_CODE) == CXX_EXCEPTION ? ", C++ " : "",
-                           rd(k, l->rec + ER_CODE) == CXX_EXCEPTION ? cxx_type(k, l->rec, type, sizeof(type)) : "");
+    nc_kernel_request_stop(k, f, "seh: unhandled exception %08x at %08x (%s)%s%s", code,
+                           addr, why, code == CXX_EXCEPTION ? ", C++ " : "",
+                           code == CXX_EXCEPTION ? cxx_type(k, l->rec, type, sizeof(type)) : "");
 }
 
 /* Calls the handler of the level's registration, or ends the level. */
@@ -389,6 +435,76 @@ static void own_handler(NcKernel *k, NcFrame *f, bool unwind)
     nc_frame_set_gpr(f, NC_EAX, r);
     nc_frame_set_gpr(f, NC_ESP, esp + 4);
     nc_frame_set_eip(f, rd(k, esp));
+}
+
+static bool range_mapped(NcVm *vm, uint32_t va, uint32_t len)
+{
+    if (!len || va + len < va) {
+        return false;
+    }
+    const uint32_t end = va + len - 1;
+    for (uint32_t p = va & ~(NC_PAGE - 1); p <= end; p += NC_PAGE) {
+        if (nc_vm_phys(vm, p) == UINT32_MAX) {
+            return false;
+        }
+        if (p > UINT32_MAX - NC_PAGE) {
+            break;
+        }
+    }
+    return true;
+}
+
+/* First-chance SEH dispatch for a hardware page fault (STATUS_ACCESS_VIOLATION)
+ * when the title has not replaced the kernel's IDT #PF handler (e.g. Serious
+ * Engine's demand-paged VirtualAlloc(MEM_RESERVE) streams). Safe from SIGSEGV. */
+bool nc_seh_page_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write)
+{
+    NcThread *t = k->current;
+    if (!t) {
+        return false;
+    }
+    const uint32_t reg = chain_head(k);
+    if (reg == CHAIN_END) {
+        return false;
+    }
+    const uint32_t sbase = rd(k, k->kpcr_va + 4), slimit = rd(k, k->kpcr_va + 8);
+    if ((reg & 3) || reg < slimit || reg + 8 > sbase || !range_mapped(k->vm, reg, 8)) {
+        return false;
+    }
+    const uint32_t esp = nc_frame_gpr(f, NC_ESP);
+    if (esp < LV_SIZE) {
+        return false;
+    }
+    const uint32_t lv_base = (esp - LV_SIZE) & ~15u;
+    if (!range_mapped(k->vm, lv_base, LV_SIZE)) {
+        return false;
+    }
+    while (t->nseh && t->seh[t->nseh - 1].base < esp) {
+        t->nseh--;
+    }
+    if (t->nseh == NC_MAX_SEH) {
+        return false;
+    }
+    NcSeh *l = &t->seh[t->nseh++];
+    memset(l, 0, sizeof(*l));
+    l->base = lv_base;
+    l->ctx = lv_base + LV_CTX;
+    l->rec = lv_base + LV_REC;
+    l->reg = reg;
+
+    const uint32_t eip = nc_frame_eip(f);
+    capture(k, f, l->ctx, eip, esp);
+    memset(nc_vm_host(k->vm, l->rec), 0, ER_SIZE);
+    wr(k, l->rec + ER_CODE, STATUS_ACCESS_VIOLATION);
+    wr(k, l->rec + ER_ADDRESS, eip);
+    wr(k, l->rec + ER_NPARAMS, 2);
+    wr(k, l->rec + ER_INFO, write ? 1u : 0u);
+    wr(k, l->rec + ER_INFO + 4, va);
+
+    k->cr2 = va;
+    k->page_faults++;
+    step(k, f, t);
+    return true;
 }
 
 void nc_seh_stub(NcKernel *k, NcFrame *f, unsigned ordinal)

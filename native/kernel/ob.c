@@ -6,7 +6,7 @@
  * (multiples of 4) map to the body. Type is the VA of the kernel's type
  * object (PsThreadObjectType, ExEventObjectType, ...).
  */
-#include "native/kernel/kernel.h"
+#include "native/kernel/iomgr.h"
 
 #define OB_HEADER 0x10u
 
@@ -20,15 +20,24 @@ static bool freeable(enum NcObType type)
     return type == NC_OB_FILE || type == NC_OB_SYMLINK;
 }
 
-static enum NcObType type_of(NcKernel *k, uint32_t object)
+enum NcObType nc_ob_type_at(NcKernel *k, uint32_t va)
 {
-    const uint32_t tva = nc_vm_rd32(k->vm, object - OB_HEADER + 0x8);
-    for (unsigned t = 0; t < NC_OB_TYPES; t++) {
-        if (k->type_va[t] == tva) {
+    for (unsigned t = 0; va && t < NC_OB_TYPES; t++) {
+        if (k->type_va[t] == va) {
             return (enum NcObType)t;
         }
     }
     return NC_OB_TYPES;
+}
+
+static enum NcObType type_of(NcKernel *k, uint32_t object)
+{
+    return nc_ob_type_at(k, nc_vm_rd32(k->vm, object - OB_HEADER + 0x8));
+}
+
+enum NcObType nc_ob_type_of(NcKernel *k, uint32_t object)
+{
+    return object ? type_of(k, object) : NC_OB_TYPES;
 }
 
 /* Frees an object no handle or reference holds any more (PointerCount 1 is
@@ -44,6 +53,12 @@ static void release(NcKernel *k, uint32_t object, enum NcObType type)
     nc_vm_wr32(k->vm, hdr + 0x8, 0);    /* a stale lookup of it fails the type check */
     k->pool_ob -= OB_HEADER + g_ob_size[type];
     nc_pool_free(k, hdr, OB_HEADER + g_ob_size[type]);
+}
+
+void nc_ob_reference(NcKernel *k, uint32_t object, uint32_t n)
+{
+    const uint32_t hdr = object - OB_HEADER;
+    nc_vm_wr32(k->vm, hdr, nc_vm_rd32(k->vm, hdr) + n);
 }
 
 void nc_ob_dereference(NcKernel *k, uint32_t object)
@@ -120,6 +135,7 @@ bool nc_ob_close(NcKernel *k, uint32_t handle)
         nc_io_close(k, object);
     }
     if (!count) {
+        nc_obname_object_closed(k, object); /* a temporary name goes with its last handle */
         release(k, object, type);
     }
     return true;

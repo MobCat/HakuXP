@@ -130,6 +130,18 @@ static bool g_eeprom_ready;
 /* The app's video settings (nc_kernel_set_video). */
 static int64_t g_video_flags = -1;
 static int g_av_pack = NC_AV_PACK_HDTV;
+static uint32_t g_title_id;
+
+/* The Xbox dashboard title ID (0xFFFE0000) bypasses console BIOS/EEPROM video
+ * mode and AV-pack restrictions so the emulator's dashboard can run at native
+ * 1920x1080 regardless of per-game video settings. */
+#define NC_DASHBOARD_TITLE_ID 0xFFFE0000u
+#define AV_DASHBOARD_HDTV_CAPS 0x004F0104u /* HDTV pack | NTSC-M | 60Hz | Widescreen | 480p | 720p | 1080i */
+
+static bool is_dashboard_title(void)
+{
+    return g_title_id == NC_DASHBOARD_TITLE_ID;
+}
 
 void nc_kernel_set_video(int64_t flags, int av_pack)
 {
@@ -151,6 +163,37 @@ static int g_tz_minutes;
 void nc_kernel_set_time_zone(int minutes_east)
 {
     g_tz_minutes = minutes_east;
+}
+
+/* The app's time zone whole (nc_kernel_set_time_zone_info): the EEPROM's
+ * 0x64-0x8F as the dashboard sets them (bias, standard and daylight names,
+ * the dates daylight saving starts and ends, their biases; the app's
+ * ConsoleTimeZone). Unset, the bias alone, from nc_kernel_set_time_zone. */
+#define TZ_BLOCK 0x2Cu
+static uint8_t g_tz_block[TZ_BLOCK];
+static bool g_tz_block_set;
+
+static int hex_nibble(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+bool nc_kernel_set_time_zone_info(const char *hex)
+{
+    uint8_t b[TZ_BLOCK];
+    if (strlen(hex) != 2 * TZ_BLOCK) {
+        return false;
+    }
+    for (unsigned i = 0; i < TZ_BLOCK; i++) {
+        const int hi = hex_nibble(hex[2 * i]), lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        b[i] = (uint8_t)(hi << 4 | lo);
+    }
+    memcpy(g_tz_block, b, sizeof(b));
+    g_tz_block_set = true;
+    return true;
 }
 
 /* The Xbox EEPROM section checksum: ones' complement of the carry-folded sum. */
@@ -257,18 +300,32 @@ static void eeprom_path(char *p, size_t len)
 static const uint8_t k_legacy_hd_key[16] = {'0', '0', '0', '0', '0', '0', '0', '0', '0', '1',
                                             0x00, 0x50, 0xF2, 0x00, 0x00, 0x01};
 
+/* A serial number as a v1.0 console's (the app's ConsoleEeprom.serial):
+ * production line, a six-digit unit number, the year's last digit and its
+ * week, the factory (L NNNNNN Y WW FF): late 2001 or early 2002, Mexico (02)
+ * or Hungary (03), where v1.0 consoles were made. */
+static void eeprom_serial(uint8_t out[12])
+{
+    uint8_t r[7];
+    arc4random_buf(r, sizeof(r));
+    const unsigned unit = (r[1] | (unsigned)r[2] << 8 | (unsigned)r[3] << 16) % 1000000u;
+    const bool late2001 = r[4] & 1;
+    const unsigned week = late2001 ? 36u + r[5] % 17u : 1u + r[5] % 26u;
+    char s[32];                         /* 12 digits; room the compiler can't rule out */
+    snprintf(s, sizeof(s), "%u%06u%u%02u%02u", 1u + r[0] % 6u, unit, late2001 ? 1u : 2u, week, (r[6] & 1) ? 2u : 3u);
+    memcpy(out, s, 12);
+}
+
 /* A console of its own: a serial number, a MAC address (Microsoft's
  * 00:50:F2 block), an online key and a confounder at random, hd_key as the
  * HD key. Two consoles on a network need different MACs (system link), Xbox
  * Live services different serials. The section is encrypted under the key
- * it was (a new or clear one's: MCPX 1.0's). */
+ * it was (a new or clear one's: MCPX 1.0's). The app makes a new console's
+ * EEPROM itself as it first starts (ConsoleEeprom), its HD key at random
+ * when the hard disk has no saves yet; this one is for runs without it. */
 static void eeprom_identity(const uint8_t hd_key[16])
 {
-    uint8_t rnd[12];
-    arc4random_buf(rnd, sizeof(rnd));
-    for (unsigned i = 0; i < 12; i++) {
-        g_eeprom[0x34 + i] = (uint8_t)('0' + rnd[i] % 10);
-    }
+    eeprom_serial(g_eeprom + 0x34);
     g_eeprom[0x40] = 0x00;
     g_eeprom[0x41] = 0x50;
     g_eeprom[0x42] = 0xF2;
@@ -384,6 +441,8 @@ static uint8_t *eeprom(NcKernel *k)
             eeprom_upgrade();
             eeprom_renew();
         }
+        uint8_t stored[EEPROM_SIZE];
+        memcpy(stored, g_eeprom, sizeof(stored));
         /* The regions follow the running title (a library mixes NTSC and
          * PAL discs); the rest stays as stored. A title always sees the
          * same image. */
@@ -401,17 +460,33 @@ static uint8_t *eeprom(NcKernel *k)
         if (g_language) {
             nc_wr32(g_eeprom + 0x90, (uint32_t)g_language);
         }
-        /* And the time zone, the phone's: its offset from UTC now as the
-         * bias (UTC = local time + bias, minutes), without daylight saving
-         * rules of its own (no names, dates or standard / daylight biases). */
-        nc_wr32(g_eeprom + 0x64, (uint32_t)-g_tz_minutes);
-        memset(g_eeprom + 0x68, 0, 8);
-        memset(g_eeprom + 0x78, 0, 8);
-        memset(g_eeprom + 0x88, 0, 8);
+        /* And the time zone, the phone's: whole from the app (names and
+         * daylight saving dates); else its offset from UTC now as the bias
+         * (UTC = local time + bias, minutes), without daylight saving rules
+         * of its own (no names, dates or standard / daylight biases). */
+        if (g_tz_block_set) {
+            memcpy(g_eeprom + 0x64, g_tz_block, TZ_BLOCK);
+        } else {
+            nc_wr32(g_eeprom + 0x64, (uint32_t)-g_tz_minutes);
+            memset(g_eeprom + 0x68, 0, 8);
+            memset(g_eeprom + 0x78, 0, 8);
+            memset(g_eeprom + 0x88, 0, 8);
+        }
         eeprom_seal();
+        /* Kept as this title sees it, so the app's Settings, Console, EEPROM
+         * shows the last game's (a title saving a setting stores it so too);
+         * not over a file that isn't a whole EEPROM. Every title gets the
+         * same image either way: these fields are set anew at each start. */
+        if ((have || !in) && memcmp(stored, g_eeprom, sizeof(stored))) {
+            eeprom_store();
+        }
         g_eeprom_ready = true;
-        nc_log("hakuX-native", "ex: video flags %08x, AV pack %d, language %u, time zone bias %d min",
-               nc_rd32(g_eeprom + 0x94), g_av_pack, nc_rd32(g_eeprom + 0x90), (int32_t)nc_rd32(g_eeprom + 0x64));
+        nc_log("hakuX-native", "ex: video flags %08x, AV pack %d, language %u, time zone bias %d min "
+               "(%.4s/%.4s, daylight %02x%02x%02x%02x to %02x%02x%02x%02x, bias %d)",
+               nc_rd32(g_eeprom + 0x94), g_av_pack, nc_rd32(g_eeprom + 0x90), (int32_t)nc_rd32(g_eeprom + 0x64),
+               (const char *)g_eeprom + 0x68, (const char *)g_eeprom + 0x6C,
+               g_eeprom[0x7C], g_eeprom[0x7D], g_eeprom[0x7E], g_eeprom[0x7F],
+               g_eeprom[0x78], g_eeprom[0x79], g_eeprom[0x7A], g_eeprom[0x7B], (int32_t)nc_rd32(g_eeprom + 0x8C));
         nc_log("hakuX-native", "ex: console serial %.12s, MAC %02x:%02x:%02x:%02x:%02x:%02x%s", g_eeprom + 0x34,
                g_eeprom[0x40], g_eeprom[0x41], g_eeprom[0x42], g_eeprom[0x43], g_eeprom[0x44], g_eeprom[0x45],
                g_sec_plain ? " (an image from before: its section in the clear)" : "");
@@ -652,7 +727,7 @@ static uint64_t DbgPrint(NcKernel *k, NcFrame *f, const uint32_t *a)
         n--;
     }
     out[n] = 0;
-    nc_log("hakuX-native-dbg", "%s", out);
+    nc_log_guest(k->current ? k->current->id : 0, "hakuX-native-dbg", "%s", out);
     return 0;
 }
 
@@ -725,12 +800,16 @@ static uint64_t AvSendTVEncoderOption(NcKernel *k, NcFrame *f, const uint32_t *a
 {
     uint32_t r = 0;
     if (a[1] == AV_QUERY_AV_CAPABILITIES) {
-        /* The AV pack (the app's: component by default), the factory video
-         * standard and refresh, and the user's video flags (480p, 720p,
-         * widescreen...): D3D lists its display modes from these. */
-        const uint8_t *e = eeprom(k);
-        r = av_pack_caps() | (nc_rd32(e + 0x58) & (AV_STANDARD_MASK | AV_REFRESH_MASK)) |
-            (nc_rd32(e + 0x94) & ~(AV_STANDARD_MASK | 0xFFu));
+        if (is_dashboard_title()) {
+            r = AV_DASHBOARD_HDTV_CAPS;
+        } else {
+            /* The AV pack (the app's: component by default), the factory video
+             * standard and refresh, and the user's video flags (480p, 720p,
+             * widescreen...): D3D lists its display modes from these. */
+            const uint8_t *e = eeprom(k);
+            r = av_pack_caps() | (nc_rd32(e + 0x58) & (AV_STANDARD_MASK | AV_REFRESH_MASK)) |
+                (nc_rd32(e + 0x94) & ~(AV_STANDARD_MASK | 0xFFu));
+        }
     }
     static uint32_t s_logged;
     if (!(s_logged & (1u << (a[1] & 31)))) {
@@ -836,22 +915,105 @@ bool nc_kernel_launch_xbe(const uint8_t page[NC_LAUNCH_PAGE], char *out, size_t 
 #define LDT_LAUNCH_DASHBOARD 1
 #define LAUNCH_DATA_OFF 0x400
 
-/* A quick reboot to the dashboard (no launch path, or the dashboard's) that
- * asks for one of its pages, a title's "create an Xbox Live account": true
- * when the dashboard is there to boot, the page then naming it. To the main
- * menu, the game closes, as without a dashboard. */
-static bool dashboard_page(uint8_t *page, char *xbe, size_t n)
+/* Active dashboard device path: defaults to C:\xboxdash.xbe, overridable via
+ * dashpath= when a manifested dashboard uses a custom entryXbe. */
+static char g_dashboard_path[256] = NC_DASHBOARD_PATH;
+
+void nc_kernel_set_dashboard_path(const char *path)
 {
-    char host[512];
-    const bool to_dash = !page[LAUNCH_PATH_OFF] || !strcasecmp(xbe, NC_DASHBOARD_PATH);
-    if (!to_dash || nc_rd32(page) != LDT_LAUNCH_DASHBOARD || !nc_rd32(page + LAUNCH_DATA_OFF) ||
-        !nc_io_host_file(NC_DASHBOARD_PATH, host, sizeof(host))) {
+    static const char prefix[] = "\\Device\\Harddisk0\\Partition";
+    if (!path || strncasecmp(path, prefix, sizeof(prefix) - 1) || strstr(path, "..")) {
+        snprintf(g_dashboard_path, sizeof(g_dashboard_path), "%s", NC_DASHBOARD_PATH);
+        return;
+    }
+    const char *slash = strrchr(path, '\\');
+    if (!slash || slash <= path + (sizeof(prefix) - 1) || !slash[1] || strlen(path) >= sizeof(g_dashboard_path)) {
+        snprintf(g_dashboard_path, sizeof(g_dashboard_path), "%s", NC_DASHBOARD_PATH);
+        return;
+    }
+    snprintf(g_dashboard_path, sizeof(g_dashboard_path), "%s", path);
+}
+
+const char *nc_kernel_dashboard_path(void)
+{
+    return g_dashboard_path;
+}
+
+#define NC_XODASH_PATH "\\Device\\Harddisk0\\Partition2\\xodash.xbe"
+
+static bool is_dashboard_path(const char *xbe)
+{
+    return !strcasecmp(xbe, NC_DASHBOARD_PATH) || !strcasecmp(xbe, NC_XODASH_PATH) ||
+           !strcasecmp(xbe, g_dashboard_path);
+}
+
+/* Disc-shipped Xbox Live dashboard updaters (dashupdate.xbe, or update.xbe
+ * with LDT_LAUNCH_DASHBOARD): games launch these to reach Xbox Live dashboard
+ * screens when stock C:\xboxdash.xbe is missing or older. Never boot them
+ * directly (they crash without stock .xtf fonts or try to overwrite C:);
+ * hand off their LD_LAUNCH_DASHBOARD payload to the installed dashboard, or
+ * report a missing dashboard when none is installed. */
+static bool is_dash_updater_path(const char *xbe, uint32_t launch_type)
+{
+    static const char cd[] = "\\Device\\CdRom0\\";
+    if (strncasecmp(xbe, cd, sizeof(cd) - 1)) {
         return false;
     }
+    const char *base = strrchr(xbe, '\\');
+    base = base ? base + 1 : xbe;
+    if (!strcasecmp(base, "dashupdate.xbe")) {
+        return true;
+    }
+    return launch_type == LDT_LAUNCH_DASHBOARD && !strcasecmp(base, "update.xbe");
+}
+
+typedef enum {
+    DASH_REQ_NONE,
+    DASH_REQ_RELAUNCH,
+    DASH_REQ_MISSING,
+} DashReqResult;
+
+/* A quick reboot to the dashboard (no launch path, the dashboard's, or a disc
+ * Xbox Live dashboard updater) that asks for one of its pages (such as Xbox
+ * Live account management or network setup): relaunches the installed dashboard
+ * with the LD_LAUNCH_DASHBOARD payload intact, or reports DASH_REQ_MISSING when
+ * no dashboard is installed. Plain exit to the main menu returns DASH_REQ_NONE
+ * so the game closes cleanly. */
+static DashReqResult dashboard_request(uint8_t *page, char *xbe, size_t n)
+{
+    char host[512];
+    const uint32_t launch_type = nc_rd32(page);
+    const uint32_t reason = nc_rd32(page + LAUNCH_DATA_OFF);
+    const bool updater = is_dash_updater_path(xbe, launch_type);
+    const bool to_dash = !page[LAUNCH_PATH_OFF] || is_dashboard_path(xbe) || updater;
+    if (!to_dash) {
+        return DASH_REQ_NONE;
+    }
+    if (!updater && (launch_type != LDT_LAUNCH_DASHBOARD || reason == 0)) {
+        return DASH_REQ_NONE;
+    }
+    const char *dash = nc_kernel_dashboard_path();
+    if (!nc_io_host_file(dash, host, sizeof(host))) {
+        return DASH_REQ_MISSING;
+    }
+    if (updater) {
+        nc_log("hakuX-native", "relaunch: redirecting %s (launch type %u, reason %u) to installed dashboard %s",
+               xbe, launch_type, reason, dash);
+        if (launch_type != LDT_LAUNCH_DASHBOARD) {
+            nc_wr32(page, LDT_LAUNCH_DASHBOARD);
+        }
+    }
+    const char *slash = strrchr(dash, '\\');
     memset(page + LAUNCH_PATH_OFF, 0, LAUNCH_PATH_LEN);
-    snprintf((char *)page + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%s", "\\Device\\Harddisk0\\Partition2;xboxdash.xbe");
-    snprintf(xbe, n, "%s", NC_DASHBOARD_PATH);
-    return true;
+    if (slash && slash > dash) {
+        snprintf((char *)page + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%.*s;%s",
+                 (int)(slash - dash), dash, slash + 1);
+    } else {
+        snprintf((char *)page + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%s",
+                 "\\Device\\Harddisk0\\Partition2;xboxdash.xbe");
+    }
+    snprintf(xbe, n, "%s", dash);
+    return DASH_REQ_RELAUNCH;
 }
 
 void nc_kernel_launch_page_restore(NcKernel *k, const uint8_t page[NC_LAUNCH_PAGE])
@@ -881,8 +1043,17 @@ static uint64_t HalReturnToFirmware(NcKernel *k, NcFrame *f, const uint32_t *a)
     if (a[0] == 2 && page) {
         uint8_t *pg = nc_vm_host(k->vm, page);
         const bool named = nc_kernel_launch_xbe(pg, xbe, sizeof(xbe));
-        go = dashboard_page(pg, xbe, sizeof(xbe)) ||
-             (named && strcasecmp(xbe, NC_DASHBOARD_PATH) &&
+        const DashReqResult dash = dashboard_request(pg, xbe, sizeof(xbe));
+        if (dash == DASH_REQ_MISSING) {
+            k->need_dashboard = true;
+            nc_kernel_request_stop(k, f,
+                                   "title requested an Xbox dashboard feature (launch type %u, reason %u, path %s), "
+                                   "but no dashboard is installed",
+                                   nc_rd32(pg), nc_rd32(pg + LAUNCH_DATA_OFF), xbe[0] ? xbe : "(dashboard)");
+            return 0;
+        }
+        go = dash == DASH_REQ_RELAUNCH ||
+             (named && !is_dashboard_path(xbe) && !is_dash_updater_path(xbe, nc_rd32(pg)) &&
               (!strncasecmp(xbe, "\\Device\\CdRom0", 14) || nc_io_host_file(xbe, host, sizeof(host))));
     }
     if (go) {
@@ -930,7 +1101,7 @@ static uint64_t HalReadSMBusValue(NcKernel *k, NcFrame *f, const uint32_t *a)
         switch (a[1]) {
         case 0x01: v = (uint8_t)version[version_idx++ % 3]; break;
         case 0x03: v = k->disc && k->disc->fd >= 0 ? 0x60 : 0x40; break; /* tray closed, media present or not */
-        case 0x04: v = av_pack_smc(); break; /* the AV pack, as the TV encoder reports it */
+        case 0x04: v = is_dashboard_title() ? 0x01u : av_pack_smc(); break; /* the AV pack, as the TV encoder reports it */
         default: break;
         }
     }
@@ -1007,10 +1178,18 @@ void nc_kernel_title_loaded(NcKernel *k, const NcDisc *disc, const NcDiscFile *x
     k->xbe_size = image_size;
     nc_mm_note_image(xbe_base, image_size);
 
-    /* Certificate (header 0x118): GameRegion at 0xA0. */
+    /* Certificate (header 0x118): TitleID at 0x08, GameRegion at 0xA0. */
     const uint32_t cert = nc_vm_rd32(k->vm, xbe_base + 0x118);
+    g_title_id = nc_vm_rd32(k->vm, cert + 0x08);
     const uint32_t region = nc_vm_rd32(k->vm, cert + 0xA0);
     k->game_region = region & 1 ? 1 : region & 2 ? 2 : region & 4 ? 4 : 1;
+
+    /* HalBootSMCVideoMode (read by XGetAVPack): SMC AV pack code (0x01 = HDTV).
+     * Dashboard title ID FFFE0000 always sees HDTV regardless of user AV pack. */
+    const uint32_t smc_video = data_va(k, "HalBootSMCVideoMode");
+    if (smc_video) {
+        nc_vm_wr32(k->vm, smc_video, is_dashboard_title() ? 0x01u : av_pack_smc());
+    }
 
     /* XeImageFileName: ANSI_STRING { Length, MaximumLength, Buffer }. */
     const char *path = k->image_path[0] ? k->image_path : "\\Device\\CdRom0\\default.xbe";

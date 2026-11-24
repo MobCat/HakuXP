@@ -1,12 +1,18 @@
 /*
  * hakuX native core — kernel area, kernel calls and system ops.
  */
-#include "native/kernel/kernel.h"
+#include "native/kernel/iomgr.h"
+#include "native/kernel/xbox_ss.h"
+#include "native/kernel/msr.h"
+#include "native/kernel/detclock.h"
+#include "native/kernel/calltrace.h"
+#include "native/kernel/detevents.h"
 #include "native/state/save.h"
 #include "native/dev/dev.h"
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
 #include "native/core/irq.h"
+#include "native/core/smc.h"
 #include "hw/xbox/hle/hitch.h"
 
 #include <ctype.h>
@@ -55,10 +61,25 @@ static const NcKExport *k_by_ordinal[NC_KORDINAL_MAX];
  * the call failed and its traffic data, pointers baked for those
  * addresses, faulted at the first race's load. The pool's later chunks
  * still come from the top (nc_vm_alloc_phys_high): one taken before a title
- * lays out its memory there would stand in it the same way. */
+ * lays out its memory there would stand in it the same way.
+ *
+ * Below Halo's block is the title's too. Halo takes 0x61000-0x19A6000 at
+ * start (0x345000 bytes at 0x61000, its 22 MiB tag space at 0x3A6000), so
+ * every request bounded below 16 MiB lands under 0x61000. Its D3D's
+ * BeginVisibilityTest takes a page per 256 test indices that way
+ * (MmAllocateContiguousMemoryEx(0x1000, 0, 0xFFFFFF, 0, 4)). With the
+ * kernel area at 256 KiB and the pool at 0x50000 one page was left: the
+ * second failed, and GetVisibilityTestResult read its null table entry at
+ * 0xC, 2 s into a saved game's load. The kernel area is 128 KiB now and
+ * the pool at 0x30000, which leaves 33 pages (0x40000-0x61000) there.
+ * POOL_BASE stays a multiple of POOL_SIZE: a state's pool is found from
+ * its process object's address rounded down to one (nc_kernel_pool_for). */
 #define POOL_SIZE  0x00010000u
 #define POOL_BASE  (NC_KERNEL_PA + NC_KERNEL_SIZE)
-_Static_assert(POOL_BASE + POOL_SIZE <= 0x61000, "the pool's first range under Halo's fixed block");
+_Static_assert(K_FAST_END <= NC_KERNEL_SIZE, "the kernel area's layout fits its pages");
+_Static_assert(POOL_BASE % POOL_SIZE == 0, "a state's pool found from its process object");
+_Static_assert(POOL_BASE + POOL_SIZE + 32 * 0x1000u <= 0x61000,
+               "pages below Halo's fixed block for its D3D's below-16 MiB requests");
 
 /* A savestate is loading: the pool's first range where the boot that made
  * it put it (the 64 KiB under its process object, whose address
@@ -374,6 +395,47 @@ static void install_fast_paths(NcKernel *k, uint8_t *km)
     k->code_next = NC_KERNEL_VA + off;
 }
 
+/* The stubs past the HLT at K_STUBS, 8 bytes apart, in this order: each is
+ * int 0x3F with its pseudo-ordinal. New ones go at the end (a savestate's
+ * kernel area has the older ones where they were). */
+static const uint16_t k_stub_ordinals[] = {
+    NC_KORDINAL_THREAD_RETURN, NC_KORDINAL_DPC_RETURN, NC_KORDINAL_CALLOUT_RETURN,
+    NC_KORDINAL_ISR_RETURN,    NC_KORDINAL_APC_RETURN, NC_KORDINAL_TRAP,
+    NC_KORDINAL_SEH_RETURN,    NC_KORDINAL_SEH_NESTED, NC_KORDINAL_SEH_COLLIDED,
+    NC_KORDINAL_KCONT,         NC_KORDINAL_IO_DRIVER};
+#define K_NSTUBS (sizeof(k_stub_ordinals) / sizeof(k_stub_ordinals[0]))
+_Static_assert(8 * (K_NSTUBS + 1) <= K_TRAMPS - K_STUBS, "the stubs fit below the trampolines");
+
+uint32_t nc_kernel_stub_va(unsigned ordinal)
+{
+    for (unsigned i = 0; i < K_NSTUBS; i++) {
+        if (k_stub_ordinals[i] == ordinal) {
+            return NC_KERNEL_VA + K_STUBS + 8 * (i + 1);
+        }
+    }
+    return 0;
+}
+
+void nc_kernel_stubs_restore(NcKernel *k)
+{
+    uint8_t *km = nc_vm_host(k->vm, NC_KERNEL_VA);
+    km[K_STUBS] = 0xF4;
+    for (unsigned i = 0; i < K_NSTUBS; i++) {
+        uint8_t *s = km + K_STUBS + 8 * (i + 1);
+        s[0] = 0xCD;
+        s[1] = NC_KCALL_VECTOR;
+        s[2] = k_stub_ordinals[i] & 0xff;
+        s[3] = k_stub_ordinals[i] >> 8;
+        s[4] = 0xF4; /* never reached: the kernel goes on elsewhere */
+    }
+}
+
+uint32_t nc_kernel_export_va(const NcKernel *k, const char *name)
+{
+    const NcKExport *e = export_named(name);
+    return e && e->abi != NC_KABI_DATA ? k->tramp_va[e->ordinal] : 0;
+}
+
 uint32_t nc_kernel_code_alloc(NcKernel *k, uint32_t len)
 {
     const uint32_t va = (k->code_next + 15) & ~15u;
@@ -409,6 +471,10 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
              * to. */
             if (strcmp(e->name, "XboxAlternateSignatureKeys") == 0) {
                 k->data_va[e->ordinal] = NC_KERNEL_VA + K_DATA_BIG;
+            }
+            /* XePublicKeyData is 284 bytes ("RSA1" blob): past those keys. */
+            if (strcmp(e->name, "XePublicKeyData") == 0) {
+                k->data_va[e->ordinal] = NC_KERNEL_VA + K_DATA_BIG + 0x100;
             }
         } else {
             uint32_t va = NC_KERNEL_VA + K_TRAMPS + e->ordinal * 8u;
@@ -448,22 +514,14 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
     /* Stubs: HLT to leave the JIT, then the return addresses of routines the
      * kernel runs (int 0x3F with a pseudo-ordinal), 8 bytes apart. */
     k->stop_va = NC_KERNEL_VA + K_STUBS;
-    km[K_STUBS] = 0xF4;
-    static const uint16_t stub_ordinals[9] = {
-        NC_KORDINAL_THREAD_RETURN, NC_KORDINAL_DPC_RETURN, NC_KORDINAL_CALLOUT_RETURN,
-        NC_KORDINAL_ISR_RETURN,    NC_KORDINAL_APC_RETURN, NC_KORDINAL_TRAP,
-        NC_KORDINAL_SEH_RETURN,    NC_KORDINAL_SEH_NESTED, NC_KORDINAL_SEH_COLLIDED};
     uint32_t *const stub_va[9] = {&k->thread_return_va, &k->dpc_return_va, &k->callout_return_va,
                                   &k->isr_return_va,    &k->apc_return_va, &k->trap_va,
                                   &k->seh_return_va,    &k->seh_nested_va, &k->seh_collided_va};
     for (unsigned i = 0; i < 9; i++) {
-        *stub_va[i] = NC_KERNEL_VA + K_STUBS + 8 * (i + 1);
-        uint8_t *s = km + K_STUBS + 8 * (i + 1);
-        s[0] = 0xCD;
-        s[1] = NC_KCALL_VECTOR;
-        s[2] = stub_ordinals[i] & 0xff;
-        s[3] = stub_ordinals[i] >> 8;
+        *stub_va[i] = nc_kernel_stub_va(k_stub_ordinals[i]);
     }
+    nc_kernel_stubs_restore(k);
+    nc_kcont_init();
 
     /* Processor control region (fs:). KPCR: NT_TIB at 0 (ExceptionList,
      * StackBase, StackLimit, ...), SelfPcr 0x1C, Prcb 0x20, Irql 0x24, PRCB at
@@ -502,7 +560,7 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
         [NC_OB_SEMAPHORE] = "ExSemaphoreObjectType", [NC_OB_MUTANT] = "ExMutantObjectType",
         [NC_OB_TIMER] = "ExTimerObjectType",         [NC_OB_FILE] = "IoFileObjectType",
         [NC_OB_DEVICE] = "IoDeviceObjectType",       [NC_OB_SYMLINK] = "ObSymbolicLinkObjectType",
-        [NC_OB_DIRECTORY] = "ObDirectoryObjectType",
+        [NC_OB_DIRECTORY] = "ObDirectoryObjectType", [NC_OB_IOCOMPLETION] = "IoCompletionObjectType",
     };
     for (unsigned i = 0; i < NC_OB_TYPES; i++) {
         const NcKExport *e = export_named(type_names[i]);
@@ -520,7 +578,13 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
     nc_intr_register(k);
     nc_apc_register(k);
     nc_io_register(k);
+    nc_irp_register(k);
+    nc_iodrv_register(k);
+    nc_kqueue_register(k);
+    nc_obname_register(k);
     nc_xc_register(k);
+    /* Log lines and the stamp on presented frames count emulated kernel calls. */
+    nc_log_count_from(&k->calls);
 
     /* Data exports read at boot. */
     uint8_t *ver = data_ptr(k, "XboxKrnlVersion");
@@ -554,12 +618,39 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
     if (kdnp) {
         kdnp[0] = 1;
     }
+    /* HakuXP's own public key, which the emulated drive's security sectors
+     * are signed with (native/kernel/xbox_ss.c): XAPI verifies them against
+     * it. Not Microsoft's key: what Microsoft signed doesn't verify, as
+     * before, when this export was empty. */
+    uint8_t *pub = data_ptr(k, "XePublicKeyData");
+    if (pub) {
+        nc_emukey_blob(pub);
+    }
     return true;
+}
+
+void nc_kernel_capture_stop_frame(NcKernel *k, NcFrame *f)
+{
+    if (!k || !f) {
+        return;
+    }
+    memset(&k->stop_info, 0, sizeof(k->stop_info));
+    k->stop_info.valid = true;
+    k->stop_info.thread_id = k->current ? k->current->id : 0;
+    k->stop_info.eip = nc_frame_eip(f);
+    k->stop_info.eflags = nc_frame_eflags(f);
+    k->stop_info.cs = nc_frame_cs(f);
+    k->stop_info.ss = 0x10;
+    for (int r = 0; r < 8; r++) {
+        k->stop_info.gpr[r] = nc_frame_gpr(f, r);
+    }
 }
 
 void nc_kernel_request_stop(NcKernel *k, NcFrame *f, const char *fmt, ...)
 {
-    (void)f;
+    if (!k->stop_info.valid && f) {
+        nc_kernel_capture_stop_frame(k, f);
+    }
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(k->stop_reason, sizeof(k->stop_reason), fmt, ap);
@@ -717,7 +808,7 @@ static void stats_tick(NcKernel *k)
            g_nc_sched.dpc_wait_max_ns / 1e6, g_nc_sched.dpc_run_max_ns / 1e6,
            (unsigned long long)g_nc_sched.dpc_slow, holds, held_max_ns / 1e6, held_out_ns / 1e6, top);
     {
-        static uint64_t cr, di, mm, ua;
+        static uint64_t cr, di, smc, mm, ua;
         char ms[240];
         uint32_t fe[6], fn[6];
         const unsigned nf = nc_mmio_fault_top(fe, fn, 6);
@@ -737,13 +828,15 @@ static void stats_tick(NcKernel *k)
         }
         const uint64_t ncr = __atomic_load_n(&g_nc_faults_callret, __ATOMIC_RELAXED),
                        ndi = __atomic_load_n(&g_nc_faults_dirty, __ATOMIC_RELAXED),
+                       nsmc = __atomic_load_n(&g_nc_faults_smc, __ATOMIC_RELAXED),
                        nmm = __atomic_load_n(&g_nc_faults_mmio, __ATOMIC_RELAXED),
                        nua = __atomic_load_n(&g_nc_faults_unaligned, __ATOMIC_RELAXED);
-        nc_log("hakuX-native-stats", "host faults per s: call-return %.0f dirty pages %.0f (pages%s) mmio %.0f "
+        nc_log("hakuX-native-stats", "host faults per s: call-return %.0f dirty pages %.0f (pages%s) smc %.0f mmio %.0f "
                "(eips%s) unaligned atomics %.0f", (double)(ncr - cr) / s, (double)(ndi - di) / s, ds,
-               (double)(nmm - mm) / s, ms, (double)(nua - ua) / s);
+               (double)(nsmc - smc) / s, (double)(nmm - mm) / s, ms, (double)(nua - ua) / s);
         cr = ncr;
         di = ndi;
+        smc = nsmc;
         mm = nmm;
         ua = nua;
     }
@@ -810,7 +903,12 @@ static unsigned recent_add(const NcThread *t, unsigned ordinal, uint32_t ret, co
     return i;
 }
 
-void nc_kernel_dump_recent(int fd)
+static void dump_line_fd(void *ctx, const char *line, size_t len)
+{
+    nc_dump_line(*(const int *)ctx, line, len);
+}
+
+void nc_kernel_dump_recent_cb(NcDumpEmitFn emit, void *ctx)
 {
     char line[256];
     /* the ring as it stands: the vCPU goes on adding calls (a guest spinning
@@ -827,8 +925,15 @@ void nc_kernel_dump_recent(int fd)
                            g_recent[i].thread, e ? e->name : "?", g_recent[i].ret, g_recent[i].args[0],
                            g_recent[i].args[1], g_recent[i].args[2], g_recent[i].args[3], g_recent[i].args[4],
                            result);
-        nc_dump_line(fd, line, (size_t)len);
+        if (len > 0) {
+            emit(ctx, line, (size_t)len < sizeof(line) ? (size_t)len : sizeof(line) - 1);
+        }
     }
+}
+
+void nc_kernel_dump_recent(int fd)
+{
+    nc_kernel_dump_recent_cb(dump_line_fd, &fd);
 }
 
 static uint8_t *pcr_irql(NcKernel *k)
@@ -1058,7 +1163,7 @@ static uint32_t pf_handler(NcKernel *k)
 
 static bool nc_kernel_title_pages(NcKernel *k)
 {
-    return pf_handler(k) != k->trap_va;
+    return pf_handler(k) != k->trap_va || nc_mm_has_reserved();
 }
 
 static void nc_kernel_fault_scope(nc_jmp_buf *env)
@@ -1162,6 +1267,15 @@ static void kcall(NcKernel *k, NcFrame *f, unsigned ordinal)
     }
     if (ordinal == NC_KORDINAL_APU_SPIN) {
         nc_kernel_apu_spin(k, f);
+        return;
+    }
+    if (ordinal == NC_KORDINAL_KCONT) {
+        nc_kcont_resume(k, f);
+        return;
+    }
+    if (ordinal == NC_KORDINAL_IO_DRIVER) {
+        /* DriverObject->MajorFunction[n](DeviceObject, Irp), stdcall */
+        nc_kernel_stub_call(k, f, nc_iodrv_dispatch, 2);
         return;
     }
     if (ordinal == NC_KORDINAL_TRAP) {
@@ -1320,6 +1434,34 @@ static void cpuid(NcFrame *f)
     nc_frame_set_gpr(f, NC_EDX, d);
 }
 
+/* RDMSR / WRMSR (msr.c), ECX the register, EDX:EAX the value. A register
+ * msr.c doesn't model is logged once (the first 16): reads give 0, writes
+ * are dropped, and the guest goes on. */
+static void msr_op(NcKernel *k, NcFrame *f, bool write, uint32_t eip)
+{
+    static uint32_t s_logged[16];
+    static unsigned s_nlogged;
+    const uint32_t msr = nc_frame_gpr(f, NC_ECX);
+    uint64_t v = (uint64_t)nc_frame_gpr(f, NC_EDX) << 32 | nc_frame_gpr(f, NC_EAX);
+    bool known;
+    if (write) {
+        known = nc_msr_write(msr, v);
+    } else {
+        known = nc_msr_read(msr, k->cpu ? nc_cpu_guest_tsc(k->cpu) : 0, &v);
+        nc_frame_set_gpr(f, NC_EAX, (uint32_t)v);
+        nc_frame_set_gpr(f, NC_EDX, (uint32_t)(v >> 32));
+    }
+    unsigned i = 0;
+    while (i < s_nlogged && s_logged[i] != msr) {
+        i++;
+    }
+    if (i == s_nlogged && s_nlogged < 16) {
+        s_logged[s_nlogged++] = msr;
+        nc_log("hakuX-native", "cpu: %s MSR %08x at %08x%s", write ? "WRMSR" : "RDMSR", msr, eip,
+               known ? "" : ": not modelled (read as 0, writes dropped)");
+    }
+}
+
 /* IN/OUT: E4/E5/E6/E7 imm8, EC/ED/EE/EF DX; a 66 prefix makes the
  * doubleword forms 16-bit. */
 static void port_io(NcFrame *f, const uint8_t *insn, unsigned size, bool out)
@@ -1345,11 +1487,198 @@ static void port_io(NcFrame *f, const uint8_t *insn, unsigned size, bool out)
     }
 }
 
+static bool first_unmapped(const NcVm *vm, uint32_t va, uint32_t len, uint32_t *out)
+{
+    for (uint32_t i = 0; i < len; i++) {
+        const uint32_t pa = nc_vm_phys(vm, va + i);
+        if (pa == UINT32_MAX || pa >= vm->ram_size) {
+            *out = va + i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rep_movs_advance(NcVm *vm, NcFrame *f, uint32_t elem, bool df, uint32_t *va, bool *write)
+{
+    uint32_t ecx = nc_frame_gpr(f, NC_ECX);
+    uint32_t esi = nc_frame_gpr(f, NC_ESI);
+    uint32_t edi = nc_frame_gpr(f, NC_EDI);
+    const uint64_t total = (uint64_t)ecx * elem;
+    if ((!df && edi < esi && (uint64_t)(esi - edi) < total) ||
+        (df && edi > esi && (uint64_t)(edi - esi) < total)) {
+        return false;
+    }
+    const int32_t step = df ? -(int32_t)elem : (int32_t)elem;
+    while (ecx) {
+        if (!df) {
+            const uint32_t srem = NC_PAGE - (esi & (NC_PAGE - 1));
+            const uint32_t drem = NC_PAGE - (edi & (NC_PAGE - 1));
+            uint32_t n = (srem < drem ? srem : drem) / elem;
+            if (n > ecx) {
+                n = ecx;
+            }
+            if (n) {
+                const uint32_t spa = nc_vm_phys(vm, esi);
+                if (spa == UINT32_MAX || spa >= vm->ram_size) {
+                    *va = esi;
+                    *write = false;
+                    break;
+                }
+                const uint32_t dpa = nc_vm_phys(vm, edi);
+                if (dpa == UINT32_MAX || dpa >= vm->ram_size) {
+                    *va = edi;
+                    *write = true;
+                    break;
+                }
+                const uint32_t bytes = n * elem;
+                memcpy(vm->phys + dpa, vm->phys + spa, bytes);
+                esi += bytes;
+                edi += bytes;
+                ecx -= n;
+                continue;
+            }
+        }
+        uint32_t bad;
+        if (first_unmapped(vm, esi, elem, &bad)) {
+            *va = bad;
+            *write = false;
+            break;
+        }
+        if (first_unmapped(vm, edi, elem, &bad)) {
+            *va = bad;
+            *write = true;
+            break;
+        }
+        for (uint32_t i = 0; i < elem; i++) {
+            vm->phys[nc_vm_phys(vm, edi + i)] = vm->phys[nc_vm_phys(vm, esi + i)];
+        }
+        esi += (uint32_t)step;
+        edi += (uint32_t)step;
+        ecx--;
+    }
+    nc_frame_set_gpr(f, NC_ESI, esi);
+    nc_frame_set_gpr(f, NC_EDI, edi);
+    nc_frame_set_gpr(f, NC_ECX, ecx);
+    return ecx == 0;
+}
+
+static bool rep_stos_advance(NcVm *vm, NcFrame *f, uint32_t elem, bool df, uint32_t *va, bool *write)
+{
+    uint32_t ecx = nc_frame_gpr(f, NC_ECX);
+    uint32_t edi = nc_frame_gpr(f, NC_EDI);
+    const uint32_t eax = nc_frame_gpr(f, NC_EAX);
+    const int32_t step = df ? -(int32_t)elem : (int32_t)elem;
+    while (ecx) {
+        if (!df) {
+            const uint32_t drem = NC_PAGE - (edi & (NC_PAGE - 1));
+            uint32_t n = drem / elem;
+            if (n > ecx) {
+                n = ecx;
+            }
+            if (n) {
+                const uint32_t dpa = nc_vm_phys(vm, edi);
+                if (dpa == UINT32_MAX || dpa >= vm->ram_size) {
+                    *va = edi;
+                    *write = true;
+                    break;
+                }
+                uint8_t *dst = vm->phys + dpa;
+                if (elem == 1) {
+                    memset(dst, eax & 0xFFu, n);
+                } else if (elem == 2) {
+                    for (uint32_t i = 0; i < n; i++) {
+                        nc_wr16(dst + 2 * i, (uint16_t)eax);
+                    }
+                } else {
+                    for (uint32_t i = 0; i < n; i++) {
+                        nc_wr32(dst + 4 * i, eax);
+                    }
+                }
+                edi += n * elem;
+                ecx -= n;
+                continue;
+            }
+        }
+        uint32_t bad;
+        if (first_unmapped(vm, edi, elem, &bad)) {
+            *va = bad;
+            *write = true;
+            break;
+        }
+        for (uint32_t i = 0; i < elem; i++) {
+            vm->phys[nc_vm_phys(vm, edi + i)] = (uint8_t)(eax >> (8 * i));
+        }
+        edi += (uint32_t)step;
+        ecx--;
+    }
+    nc_frame_set_gpr(f, NC_EDI, edi);
+    nc_frame_set_gpr(f, NC_ECX, ecx);
+    return ecx == 0;
+}
+
+/* FEX's MemCpy/MemSet IR for REP MOVS/STOS keeps ESI/EDI/ECX in host temps
+ * until the loop finishes, so a mid-copy fault leaves them at the start.
+ * Advance through all currently resident pages so demand-paged handlers
+ * (Serious Engine's sliding-window CTFileStream) make forward progress. */
+static bool rep_string_advance(NcKernel *k, NcFrame *f, uint32_t *va, bool *write)
+{
+    const uint32_t eip = nc_frame_eip(f);
+    bool has_rep = false, op16 = false;
+    uint32_t off = 0;
+    uint8_t opc = 0;
+    while (off < 6) {
+        const uint32_t pa = nc_vm_phys(k->vm, eip + off);
+        if (pa == UINT32_MAX || pa >= k->vm->ram_size) {
+            return false;
+        }
+        const uint8_t b = k->vm->phys[pa];
+        off++;
+        if (b == 0xF3) {
+            has_rep = true;
+        } else if (b == 0x66) {
+            op16 = true;
+        } else if (b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E) {
+            continue;
+        } else {
+            opc = b;
+            break;
+        }
+    }
+    if (!has_rep || !nc_frame_gpr(f, NC_ECX)) {
+        return false;
+    }
+    uint32_t elem = 0;
+    bool is_movs = false;
+    if (opc == 0xA4 || opc == 0xA5) {
+        is_movs = true;
+        elem = opc == 0xA4 ? 1u : op16 ? 2u : 4u;
+    } else if (opc == 0xAA || opc == 0xAB) {
+        elem = opc == 0xAA ? 1u : op16 ? 2u : 4u;
+    } else {
+        return false;
+    }
+    const bool df = (nc_frame_eflags(f) & 0x400u) != 0;
+    const bool done = is_movs ? rep_movs_advance(k->vm, f, elem, df, va, write)
+                              : rep_stos_advance(k->vm, f, elem, df, va, write);
+    if (done) {
+        nc_frame_set_eip(f, eip + off);
+        return true;
+    }
+    return false;
+}
+
 bool nc_kernel_page_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write)
 {
+    if (!k->in_call && rep_string_advance(k, f, &va, &write)) {
+        return true;
+    }
     const uint32_t handler = pf_handler(k);
+    if (handler == k->trap_va) {
+        return nc_seh_page_fault(k, f, va, write);
+    }
     const uint32_t esp = nc_frame_gpr(f, NC_ESP) - 16;
-    if (handler == k->trap_va || nc_vm_phys(k->vm, esp) == UINT32_MAX || nc_vm_phys(k->vm, esp + 15) == UINT32_MAX) {
+    if (nc_vm_phys(k->vm, esp) == UINT32_MAX || nc_vm_phys(k->vm, esp + 15) == UINT32_MAX) {
         return false;
     }
     /* As a ring-0 interrupt gate: EFLAGS, CS, EIP (the faulting instruction,
@@ -1365,6 +1694,19 @@ bool nc_kernel_page_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write)
     k->cr2 = va;
     k->page_faults++;
     return true;
+}
+
+void nc_kernel_unhandled_fault(NcKernel *k, NcFrame *f, uint32_t va, bool write)
+{
+    k->cr2 = va;
+    nc_kernel_capture_stop_frame(k, f);
+    k->stop_info.has_fault = true;
+    k->stop_info.fault_write = write;
+    k->stop_info.fault_va = va;
+    k->stop_info.exception_code = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+    nc_kernel_request_stop(k, f, "page fault at %08x from eip %08x (%s) not handled by the title", va,
+                           nc_frame_eip(f), write ? "write" : "read");
+    nc_frame_set_eip(f, k->stop_va);
 }
 
 bool nc_kernel_resident(NcKernel *k, uint32_t va, uint32_t len, bool write)
@@ -1576,6 +1918,15 @@ bool nc_kernel_sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
             ordinal = nc_rd16(insn + 2);
         }
     }
+    if (nc_detev_on()) {
+        /* a playbook's: a vblank in a spin, and what the title was doing
+         * (a forced vblank's report) */
+        NcKernel *k = opaque;
+        const uint32_t at = nc_frame_eip(f);
+        const uint8_t *insn = nc_vm_phys(k->vm, at) != UINT32_MAX ? nc_vm_host(k->vm, at) : NULL;
+        nc_detev_sysop(f, (unsigned)op, k->current ? k->current->id : 0,
+                       op == NC_SYSOP_INT && insn && insn[1] == NC_KCALL_VECTOR ? nc_rd16(insn + 2) : 0);
+    }
     const bool r = sysop(opaque, f, op, size);
     if (t0) {
         NcKernel *k = opaque;
@@ -1620,6 +1971,11 @@ static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
         break;
     case NC_SYSOP_CPUID:
         cpuid(f);
+        nc_frame_set_eip(f, eip + size);
+        break;
+    case NC_SYSOP_RDMSR:
+    case NC_SYSOP_WRMSR:
+        msr_op(k, f, op == NC_SYSOP_WRMSR, eip);
         nc_frame_set_eip(f, eip + size);
         break;
     case NC_SYSOP_IN:
@@ -1668,6 +2024,12 @@ static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
         clock_tick(k);
         break;
     case NC_SYSOP_HOOK:
+        if (nc_detclock_hook(k, f, eip)) {     /* a playbook's RDTSC */
+            break;
+        }
+        if (nc_calltrace_hook(k, f, eip)) {    /* debug: NC_TRACE_EIP */
+            break;
+        }
         if (nc_x86mmio_hook(k, f, eip)) {
             break;
         }

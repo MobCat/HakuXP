@@ -50,6 +50,8 @@ void nc_des_parity(uint8_t *key, size_t len);
 
 /* a = b^c mod d over n little-endian 32-bit words. False if d is zero. */
 bool nc_modexp(uint32_t *a, const uint32_t *b, const uint32_t *c, const uint32_t *d, unsigned n);
+/* r (n words) = x (xn words) mod m (n words, nonzero). */
+void nc_bn_mod(uint32_t *r, const uint32_t *x, unsigned xn, const uint32_t *m, unsigned n);
 
 #ifdef __cplusplus
 }
