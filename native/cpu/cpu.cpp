@@ -74,6 +74,7 @@ namespace {
 class Syscalls final : public FEXCore::HLE::SyscallHandler {
 public:
   NcCpuConfig Cfg {};
+  NcCpu* Cpu {};
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     const uint64_t Info = Frame->SystemOpInfo;
@@ -85,6 +86,21 @@ public:
     }
     nc_log("hakuX-native", "cpu: unhandled %s at %08x", Info ? "system op" : "syscall", static_cast<uint32_t>(Frame->State.rip));
     abort();
+  }
+  void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Start, uint64_t Length) override {
+    if (Cfg.code_page_mark && Length) {
+      Cfg.code_page_mark(Cfg.opaque, static_cast<uint32_t>(Start), static_cast<uint32_t>(Length));
+    }
+  }
+  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState*, uint64_t Start, uint64_t Length) override {
+    if (Cpu && Length) {
+      nc_cpu_invalidate(Cpu, static_cast<uint32_t>(Start), static_cast<uint32_t>(Length));
+    }
+  }
+  void PreCompile() override {
+    if (Cfg.pre_compile) {
+      Cfg.pre_compile(Cfg.opaque);
+    }
   }
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
     return {0, 1ull << 32, true};
@@ -191,6 +207,29 @@ struct NcCpu {
 static bool HookAdapter(void* Opaque, uint64_t Rip) {
   auto* Cpu = static_cast<NcCpu*>(Opaque);
   return Cpu->Sys.Cfg.hook_query(Cpu->Sys.Cfg.opaque, static_cast<uint32_t>(Rip));
+}
+
+static bool SmcPageAdapter(void* Opaque, uint64_t GuestPage) {
+  auto* Cpu = static_cast<NcCpu*>(Opaque);
+  return Cpu->Sys.Cfg.smc_page_query(Cpu->Sys.Cfg.opaque, static_cast<uint32_t>(GuestPage));
+}
+
+extern "C" bool nc_cpu_smc_enabled(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char* e = getenv("NC_SMC");
+    char v[128] = "";
+#ifdef __ANDROID__
+    static_assert(sizeof(v) >= PROP_VALUE_MAX);
+    hle_prop_get("debug.hakux.smc", v);
+#endif
+    const bool off = (e && !strcmp(e, "0")) || !strcmp(v, "0");
+    enabled = off ? 0 : 1;
+    if (off) {
+      nc_log("hakuX-native", "cpu: SMC tracking disabled (NC_SMC=0 / debug.hakux.smc=0)");
+    }
+  }
+  return enabled != 0;
 }
 
 extern "C" void nc_frame_save(const NcFrame* f, NcCpuContext* c) {
@@ -330,6 +369,7 @@ extern "C" NcCpu* nc_cpu_create(const NcCpuConfig* cfg, uint32_t fs_base) {
 
   auto* Cpu = new NcCpu {};
   Cpu->Sys.Cfg = *cfg;
+  Cpu->Sys.Cpu = Cpu;
   Cpu->X87Watch = !x87_full && !x87_pc_off;
   Cpu->CTX = FEXCore::Context::Context::CreateNewContext(FEX::FetchHostFeatures());
   Cpu->CTX->SetSignalDelegator(&Cpu->Sig);
@@ -339,6 +379,9 @@ extern "C" NcCpu* nc_cpu_create(const NcCpuConfig* cfg, uint32_t fs_base) {
   Cpu->CTX->SetIDTRegister(cfg->idt_base, cfg->idt_limit);
   if (cfg->hook_query) {
     Cpu->CTX->SetHookQuery(HookAdapter, Cpu);
+  }
+  if (cfg->smc_page_query) {
+    Cpu->CTX->SetSmcPageQuery(SmcPageAdapter, Cpu);
   }
   Cpu->CTX->EnableExitOnHLT();
   Cpu->CTX->SetGuestCycleCounterRatio(TscRatioQ32());
@@ -456,6 +499,15 @@ extern "C" uint64_t nc_cpu_guest_cycles(NcCpu* cpu) {
   return nc_cpu_host_cycles() - cpu->Thread->CurrentFrame->CycleCounterOffset;
 }
 
+extern "C" uint64_t nc_cpu_tsc_of_cycles(uint64_t cycles) {
+  return static_cast<uint64_t>((static_cast<unsigned __int128>(cycles) * TscRatioQ32()) >> 32);
+}
+
+extern "C" uint64_t nc_cpu_guest_tsc(NcCpu* cpu) {
+  // as the translated RDTSC computes it (OpcodeDispatcher's CycleCounter)
+  return static_cast<uint64_t>((static_cast<unsigned __int128>(nc_cpu_guest_cycles(cpu)) * TscRatioQ32()) >> 32);
+}
+
 extern "C" void nc_cpu_guest_cycles_set(NcCpu* cpu, uint64_t ticks) {
   cpu->Thread->CurrentFrame->CycleCounterOffset = nc_cpu_host_cycles() - ticks;
 }
@@ -498,6 +550,53 @@ extern "C" uint64_t* nc_frame_rip(NcFrame* f) {
 
 extern "C" void nc_frame_set_eflags(NcFrame* f, uint32_t eflags) {
   F(f).Thread->CTX->SetFlagsFromCompactedEFLAGS(F(f).Thread, eflags);
+}
+
+extern "C" void nc_frame_fxsave(const NcFrame* f, uint8_t fx[512]) {
+  const auto& S = F(f).State;
+  memset(fx, 0, 512);
+  nc_wr16(fx + 0, S.FCW);
+  uint16_t fsw = 0;
+  for (unsigned b = 0; b <= 10; b++) {
+    if (S.flags[FEXCore::X86State::X87FLAG_BASE + b]) {
+      fsw |= static_cast<uint16_t>(1u << b);
+    }
+  }
+  const unsigned top = S.flags[FEXCore::X86State::X87FLAG_TOP_LOC] & 7u;
+  fsw |= static_cast<uint16_t>(top << 11);
+  if (S.flags[FEXCore::X86State::X87FLAG_C3_LOC]) {
+    fsw |= static_cast<uint16_t>(1u << 14);
+  }
+  if (S.flags[FEXCore::X86State::X87FLAG_B_LOC]) {
+    fsw |= static_cast<uint16_t>(1u << 15);
+  }
+  nc_wr16(fx + 2, fsw);
+  fx[4] = S.AbridgedFTW;
+  nc_wr32(fx + 24, S.mxcsr);
+  nc_wr32(fx + 28, 0xFFFFu);
+  for (unsigned i = 0; i < 8; i++) {
+    memcpy(fx + 32 + 16 * i, &S.mm[(top + i) & 7u], 16);
+    memcpy(fx + 160 + 16 * i, &S.xmm.sse.data[i][0], 16);
+  }
+}
+
+extern "C" void nc_frame_fxrstor(NcFrame* f, const uint8_t fx[512]) {
+  auto& S = F(f).State;
+  S.FCW = nc_rd16(fx + 0);
+  const uint16_t fsw = nc_rd16(fx + 2);
+  for (unsigned b = 0; b <= 10; b++) {
+    S.flags[FEXCore::X86State::X87FLAG_BASE + b] = static_cast<uint8_t>((fsw >> b) & 1u);
+  }
+  const unsigned top = (fsw >> 11) & 7u;
+  S.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = static_cast<uint8_t>(top);
+  S.flags[FEXCore::X86State::X87FLAG_C3_LOC] = static_cast<uint8_t>((fsw >> 14) & 1u);
+  S.flags[FEXCore::X86State::X87FLAG_B_LOC] = static_cast<uint8_t>((fsw >> 15) & 1u);
+  S.AbridgedFTW = fx[4];
+  S.mxcsr = nc_rd32(fx + 24);
+  for (unsigned i = 0; i < 8; i++) {
+    memcpy(&S.mm[(top + i) & 7u], fx + 32 + 16 * i, 16);
+    memcpy(&S.xmm.sse.data[i][0], fx + 160 + 16 * i, 16);
+  }
 }
 
 extern "C" uint32_t nc_cpu_guest_eip_at(NcCpu* cpu, uintptr_t host_pc) {
@@ -606,5 +705,26 @@ extern "C" bool nc_cpu_callret_fault(NcCpu* cpu, uintptr_t fault_addr, void* uco
   }
   // REG_CALLRET_SP (x25) back to the default location, leaving room both ways.
   static_cast<ucontext_t*>(ucontext)->uc_mcontext.regs[25] = Base + CRS / 4;
+  return true;
+}
+
+extern "C" bool nc_cpu_smc_self_mod_step(NcCpu* cpu, void* ucontext, uint32_t va, uint32_t len) {
+  if (!cpu || !cpu->Thread || !ucontext || !len) {
+    return false;
+  }
+  auto* Thread = cpu->Thread;
+  auto* uc = static_cast<ucontext_t*>(ucontext);
+  if (!cpu->CTX->IsAddressInCodeBuffer(Thread, uc->uc_mcontext.pc) ||
+      cpu->CTX->IsCurrentBlockSingleInst(Thread) ||
+      !cpu->CTX->IsAddressInCurrentBlock(Thread, va, len)) {
+    return false;
+  }
+  if (!cpu->CTX->RestoreRIPFromHostPC(Thread, uc->uc_mcontext.pc) || !nc_cpu_fault_frame(cpu, ucontext)) {
+    return false;
+  }
+  auto& mc = uc->uc_mcontext;
+  mc.pc = cpu->Sig.GetConfig().AbsoluteLoopTopAddressFillSRA;
+  mc.sp = Thread->CurrentFrame->ReturningStackLocation;
+  mc.regs[1] = 1; // ENTRY_FILL_SRA_SINGLE_INST_REG: single-step the store
   return true;
 }

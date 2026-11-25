@@ -108,6 +108,15 @@ typedef struct NcCpuConfig {
     /* Hooked guest addresses, asked at translation time (optional). Answers
      * must stay put for translated code (nc_cpu_invalidate when they change). */
     bool (*hook_query)(void *opaque, uint32_t eip);
+    /* Called when the JIT first compiles code from guest pages [va, va+len),
+     * so the embedder can arm SMC write-protection on those pages. */
+    void (*code_page_mark)(void *opaque, uint32_t va, uint32_t len);
+    /* Asked at translation time for a page-aligned guest VA: true selects
+     * inline CRC code validation on that page instead of write-protection. */
+    bool (*smc_page_query)(void *opaque, uint32_t va_page);
+    /* Called right before compiling a block (outside the invalidation lock)
+     * to drain deferred cross-thread invalidations. */
+    void (*pre_compile)(void *opaque);
     uint32_t idt_base; /* what SIDT reports */
     uint16_t idt_limit;
 } NcCpuConfig;
@@ -148,6 +157,11 @@ uint64_t nc_cpu_host_cycles(void);
  * left out), and setting it (a savestate's: the count goes on from there). */
 uint64_t nc_cpu_guest_cycles(NcCpu *cpu);
 void nc_cpu_guest_cycles_set(NcCpu *cpu, uint64_t ticks);
+/* What the guest's RDTSC reads now: nc_cpu_guest_cycles at 733,333,333 Hz,
+ * the Xbox CPU's clock (RDMSR of the TSC, msr.c). */
+uint64_t nc_cpu_guest_tsc(NcCpu *cpu);
+/* What RDTSC reads for a count of host counter ticks (nc_cpu_guest_cycles'). */
+uint64_t nc_cpu_tsc_of_cycles(uint64_t cycles);
 /* Whether a thread selected x87 single precision (nc_cpu_x87_single_check),
  * and selecting it again in a new run (a savestate's). */
 bool nc_cpu_x87_single(NcCpu *cpu);
@@ -161,6 +175,10 @@ uint16_t nc_frame_cs(const NcFrame *f);
 /* The frame's flags as EFLAGS (for host code that wants them whole). */
 uint32_t nc_frame_eflags(NcFrame *f);
 void nc_frame_set_eflags(NcFrame *f, uint32_t eflags);
+/* Save/restore the guest's x87/MMX/SSE state as a 512-byte x86 FXSAVE image
+ * (CONTEXT.FloatSave for SEH dispatch and NtContinue). */
+void nc_frame_fxsave(const NcFrame *f, uint8_t fx[512]);
+void nc_frame_fxrstor(NcFrame *f, const uint8_t fx[512]);
 /* The frame's GPRs (x86 order, low 32 bits used) and EIP, for code that
  * moves all of them at once (the HLE hook glue). */
 uint64_t *nc_frame_regs(NcFrame *f);
@@ -195,6 +213,16 @@ bool nc_cpu_unaligned_fault(NcCpu *cpu, int code, void *ucontext);
  * CALL/RET, e.g. across guest thread switches): resets its pointer in the
  * faulting context (a ucontext_t *) as FEX's front ends do. True if handled. */
 bool nc_cpu_callret_fault(NcCpu *cpu, uintptr_t fault_addr, void *ucontext);
+
+/* After an SMC write fault on guest pages [va, va+len): if the faulting
+ * host PC is in a multi-instruction JIT block covering [va, va+len), spill
+ * guest state and redirect ucontext to re-execute the faulting instruction
+ * as a single-instruction block so modified code ahead is fetched fresh. */
+bool nc_cpu_smc_self_mod_step(NcCpu *cpu, void *ucontext, uint32_t va, uint32_t len);
+
+/* Whether SMC tracking is enabled (default true; A/B off with NC_SMC=0 or
+ * debug.hakux.smc=0). */
+bool nc_cpu_smc_enabled(void);
 
 #ifdef __cplusplus
 }
