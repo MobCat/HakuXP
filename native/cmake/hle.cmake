@@ -4,7 +4,7 @@
 #
 # Vulkan dependencies come from NC_DEPS (same revisions as the app build):
 #   volk, glslang, spirv_reflect, vma, root/subprojects/nv2a_vsh_cpu.
-set(NC_DEPS "D:/tools/native-deps" CACHE PATH "native core third-party sources")
+set(NC_DEPS "${NC_REPO}/deps" CACHE PATH "native core third-party sources")
 
 add_library(nc_volk STATIC "${NC_DEPS}/volk/volk.c")
 target_include_directories(nc_volk PUBLIC "${NC_DEPS}/volk")
@@ -46,6 +46,7 @@ add_library(hakux_hle STATIC
   ${NC_HLE}/pb/pbdraw.c
   ${NC_HLE}/pb/pbmode.c
   ${NC_HLE}/pb/pbres.c
+  ${NC_HLE}/pb/pbslot.c
   ${NC_HLE}/pb/pbstate.c
   ${NC_HLE}/pb/pusher.c
   ${NC_HLE}/shader/ff_gen.c
@@ -57,6 +58,8 @@ add_library(hakux_hle STATIC
   ${NC_HLE}/tex/xg_swizzle.c
   ${NC_HLE}/uma/uma.c
   ${NC_HLE}/util/thread.c
+  ${NC_HLE}/util/stamp.c
+  ${NC_HLE}/util/age.c
   ${NC_HLE}/vk/back.c
   ${NC_HLE}/vk/display.c
   ${NC_HLE}/vk/swapchain.c
@@ -94,6 +97,7 @@ target_link_libraries(hakux_hle PUBLIC nc_glib nc_volk nc_spirv_reflect glslang 
 set(NC_APU "${CMAKE_CURRENT_SOURCE_DIR}/dev/apu")
 add_library(hakux_apu STATIC
   ${NC_APU}/apu.c
+  ${NC_APU}/lockstep.c
   ${NC_APU}/out.c
   ${NC_APU}/state.c
   ${NC_APU}/dsp/debug.c

@@ -24,7 +24,8 @@
  *   clock=MS         its clock's distance from the phone's time
  *   tz=MINUTES       its time zone, east of UTC
  *   net=off|nat|lan|kai  its network (native/net/net.h); with it dns=,
- *                    lanport=, lanbcast=, lanpeers=, kai=
+ *                    ip=, mask=, gw=, hostname=, lanport=, lanbcast=,
+ *                    lanpeers=, kai=
  *
  * The front end's own (the picture's shape and filters, the input, the
  * Vulkan driver) stay with it.

@@ -111,6 +111,7 @@ static const char *fatal_kind_name(int kind)
     case NC_FATAL_BOOT:     return "BOOT";
     case NC_FATAL_STOPPED:  return "STOPPED";
     case NC_FATAL_DASHBOARD: return "DASHBOARD";
+    case NC_FATAL_MISSING_XBE: return "MISSING_XBE";
     default:                return "UNKNOWN";
     }
 }

@@ -15,6 +15,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -63,6 +64,16 @@ static bool xbe_read(const NcDisc *disc, const NcXbe *x, uint64_t off, void *buf
         return nc_xbe_host_read(x->fd, off, buf, len);
     }
     return nc_disc_read(disc, &x->file, off, buf, len);
+}
+
+static const char *xbe_basename(const char *p)
+{
+    const char *s = strrchr(p, '\\');
+    const char *f = strrchr(p, '/');
+    if (f && (!s || f > s)) {
+        s = f;
+    }
+    return s && s[1] ? s + 1 : p;
 }
 
 bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel *k, NcXbe *out)
@@ -207,5 +218,6 @@ bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel 
         nc_log("hakuX-native-imports", "title %08X imports %u kernel functions not implemented here: %s",
                x->title_id, nmissing, missing);
     }
+    snprintf(out->name, sizeof(out->name), "%s", xbe_basename(out->fd >= 0 ? g_host : path));
     return true;
 }

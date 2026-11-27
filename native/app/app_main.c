@@ -10,7 +10,8 @@
  *            "upscale=bilinear|sgsr" how a frame smaller than its place on
  *            screen is scaled up; "padinput=sdl" the legacy input (the first
  *            SDL gamepad as player 1); "vkdriver=" the custom Vulkan driver
- *            (vkdriver.c)
+ *            (vkdriver.c); "playbook=", "record=", "playrun=" a playbook
+ *            played or recorded (playbook_jni.c)
  *
  * The core boots and runs on its own thread (FEX keeps per-thread state, so
  * boot and run share it). This thread owns the window: it hands the
@@ -21,6 +22,7 @@
 #include "native/app/app.h"
 #include "native/core/cheats.h"
 #include "native/core/core.h"
+#include "native/core/crash_report.h"
 #include "native/core/mods.h"
 #include "native/core/options.h"
 #include "native/dev/usb.h"
@@ -31,6 +33,7 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <jni.h>
 #include <pthread.h>
@@ -143,6 +146,67 @@ EXPORT JNIEXPORT void JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nati
         publish_pad((unsigned)player);
     }
     pthread_mutex_unlock(&g_overlay_lock);
+}
+
+/* A Steel Battalion controller's state (the router's, by player): buttons
+ * bit NC_SBC_*; levers, stick and pedals as native/dev/xidtype.h; tuner
+ * 0-15; gear -2 R, -1 N, 1-5. Not merged with the overlay (it has none). */
+EXPORT JNIEXPORT void JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeSetSbc(
+    JNIEnv *env, jclass cls, jint player, jlong buttons, jint aim_x, jint aim_y, jint rotation, jint sight_x,
+    jint sight_y, jint pedal_l, jint pedal_m, jint pedal_r, jint tuner, jint gear)
+{
+    if (player < 0 || player >= 4) {
+        return;
+    }
+    NcSbcState s;
+    memset(&s, 0, sizeof(s));       /* padding too: nc_sbc_set compares states */
+    s.buttons = (uint64_t)buttons;
+    s.aim_x = (uint16_t)aim_x;
+    s.aim_y = (uint16_t)aim_y;
+    s.rotation = (int16_t)rotation;
+    s.sight_x = (int16_t)sight_x;
+    s.sight_y = (int16_t)sight_y;
+    s.pedal[0] = (uint16_t)pedal_l;
+    s.pedal[1] = (uint16_t)pedal_m;
+    s.pedal[2] = (uint16_t)pedal_r;
+    s.tuner = (uint8_t)tuner;
+    s.gear = (int8_t)gear;
+    nc_sbc_set((unsigned)player, &s);
+}
+
+/* Another type of controller for the player as the game runs (the menu's
+ * Controllers): "duke", "s", "sbc", "wheel" (native/dev/xidtype.h). */
+EXPORT JNIEXPORT void JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeSetPadType(JNIEnv *env,
+                                                                                          jclass cls, jint player,
+                                                                                          jstring jtype)
+{
+    const char *type = (*env)->GetStringUTFChars(env, jtype, NULL);
+    const int kind = type ? nc_xid_kind_by_id(type, strlen(type)) : -1;
+    if (type) {
+        (*env)->ReleaseStringUTFChars(env, jtype, type);
+    }
+    if (player >= 0 && player < 4 && kind >= 0) {
+        nc_dev_ohci_set_pad_kind((unsigned)player, (unsigned)kind);
+    }
+}
+
+/* The last output report the title sent the player's controller (the
+ * guide's picture lights a Steel Battalion controller's lamps from it);
+ * null before the first. */
+EXPORT JNIEXPORT jbyteArray JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetPadOutput(JNIEnv *env,
+                                                                                                jclass cls,
+                                                                                                jint player)
+{
+    uint8_t out[NC_XID_REPORT_MAX];
+    const int n = player >= 0 && player < 4 ? nc_xid_output((unsigned)player, out) : 0;
+    if (n <= 0) {
+        return NULL;
+    }
+    jbyteArray a = (*env)->NewByteArray(env, n);
+    if (a) {
+        (*env)->SetByteArrayRegion(env, a, 0, n, (const jbyte *)out);
+    }
+    return a;
 }
 
 /* native/dev/apu/out.c: the output stream paused with the emulation */
@@ -304,6 +368,96 @@ EXPORT JNIEXPORT jfloatArray JNICALL Java_com_rfandango_haku_1x_NativeCoreActivi
     return a;
 }
 
+/* The FPS overlay's input line: {out, read} in ms, a controller's changes
+ * (any player's) to the screen and to the title's read (native/dev/inlat.h),
+ * the mean since the last call; null before the first. */
+EXPORT JNIEXPORT jfloatArray JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetInputTiming(JNIEnv *env,
+                                                                                                     jclass cls)
+{
+    float v[2];
+    if (!nc_pad_input_timing(&v[0], &v[1])) {
+        return NULL;
+    }
+    jfloatArray a = (*env)->NewFloatArray(env, 2);
+    if (a) {
+        (*env)->SetFloatArrayRegion(env, a, 0, 2, v);
+    }
+    return a;
+}
+
+/* The emulation count now (native/core/log.c), -1 before the kernel runs:
+ * the activity passes it on (ec=) when the session goes on in a new process,
+ * so the log's counts never repeat. */
+EXPORT JNIEXPORT jlong JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetEc(JNIEnv *env, jclass cls)
+{
+    uint64_t ec;
+    return nc_log_count(&ec) ? (jlong)(ec & 0x7FFFFFFFFFFFFFFFull) : -1;
+}
+
+/* The guide's Mark log: the owner's note as a log line at this moment
+ * ("hakuX-native-mark: [EC] <note>"), for finding it in a capture later;
+ * the EC it was logged at (-1 before the kernel runs). */
+EXPORT JNIEXPORT jlong JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeMarkLog(JNIEnv *env, jclass cls,
+                                                                                          jstring note)
+{
+    const char *text = note ? (*env)->GetStringUTFChars(env, note, NULL) : NULL;
+    uint64_t ec;
+    const bool have = nc_log_count(&ec);
+    nc_log("hakuX-native-mark", "%s", text && text[0] ? text : "(no note)");
+    if (text) {
+        (*env)->ReleaseStringUTFChars(env, note, text);
+    }
+    return have ? (jlong)(ec & 0x7FFFFFFFFFFFFFFFull) : -1;
+}
+
+/* The guide's "EC in the corner": the count stamped on each frame, on or off now. */
+EXPORT JNIEXPORT void JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeSetStamp(JNIEnv *env, jclass cls,
+                                                                                          jboolean on)
+{
+    nc_present_set_stamp(on);
+}
+
+/* The guide's "File I/O trace": every file read and write logged by handle,
+ * on or off now (native/kernel/io.c). */
+EXPORT JNIEXPORT void JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeSetIoTrace(JNIEnv *env, jclass cls,
+                                                                                            jboolean on)
+{
+    nc_io_set_trace(on);
+}
+
+EXPORT JNIEXPORT jboolean JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetIoTrace(JNIEnv *env,
+                                                                                            jclass cls)
+{
+    return nc_io_trace();
+}
+
+/* The FPS overlay's IDs line, "MS04204A | 4D53002A": the running XBE's XMID
+ * and title ID (a title update's or the dashboard's when they run), null
+ * before one is loaded. Set once at load, before the core runs. */
+EXPORT JNIEXPORT jstring JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetTitleIds(JNIEnv *env,
+                                                                                            jclass cls)
+{
+    const HleXbeInfo *x = &g_core.xbe.info;
+    if (!x->title_id) {
+        return NULL;
+    }
+    char xmid[HLE_XBE_ID_MAX], line[48];
+    hle_xbe_xmid(x, xmid);
+    snprintf(line, sizeof(line), "%s | %08X", xmid, x->title_id);
+    return (*env)->NewStringUTF(env, line);
+}
+
+/* The FPS overlay's running XBE filename ("default.xbe", "xonlinedash.xbe"),
+ * null before one is loaded. Set once at load, before the core runs. */
+EXPORT JNIEXPORT jstring JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetXbeName(JNIEnv *env,
+                                                                                            jclass cls)
+{
+    if (SDL_GetAtomicInt(&g_core_state) == 0 || !g_core.xbe.name[0]) {
+        return NULL;
+    }
+    return (*env)->NewStringUTF(env, g_core.xbe.name);
+}
+
 /* NativeCoreActivity: why the game can't run here (the GPU driver lacks
  * what the HLE GPU needs), or null. */
 const char *nc_hle_fatal(void);
@@ -326,6 +480,21 @@ EXPORT JNIEXPORT jint JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nati
     return nc_hle_fatal_kind();
 }
 
+/* Detailed ASCII crash diagnostics (CPU registers, fault info, stack trace,
+ * XBE layout, recent kernel calls, threads, native device and Vulkan GPU). */
+EXPORT JNIEXPORT jstring JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeBuildCrashReport(JNIEnv *env,
+                                                                                                      jclass cls)
+{
+    const bool stopped = SDL_GetAtomicInt(&g_core_state) == -1;
+    char *report = nc_crash_report_build(&g_core, stopped, nc_hle_fatal(), nc_hle_fatal_kind());
+    if (!report) {
+        return NULL;
+    }
+    jstring out = (*env)->NewStringUTF(env, report);
+    free(report);
+    return out;
+}
+
 /* The HLE GPU's stutter and hang monitor for the overlay, under the FPS line
  * (as the xemu-based app shows it): counts, the ongoing or last hang, the
  * last stutter; "" with nothing to show. */
@@ -339,6 +508,43 @@ EXPORT JNIEXPORT jstring JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_n
         buf[0] = 0;
     }
     return (*env)->NewStringUTF(env, buf);
+}
+
+/* Settings > Debug > Last timeout: the monitor's last hang and stutter older
+ * than this show "--" for their age (0: always the age; hw/xbox/hle/hitch.h). */
+void hle_hitch_set_age_limit(int seconds);
+
+EXPORT JNIEXPORT void JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeSetHitchTimeout(JNIEnv *env,
+                                                                                            jclass cls,
+                                                                                            jint seconds)
+{
+    hle_hitch_set_age_limit(seconds);
+}
+
+/* The title's pace, from the same monitor (hw/xbox/hle/hitch.h). */
+bool hle_hitch_pace(int *pace, float *hz);
+
+/* The FPS overlay's target and resolution lines: {pace in vblanks (0: not
+ * known yet, -1: none / IMMEDIATE, -2: n/a), the mode's vblank rate in
+ * Hz x 100, the title's width, height, the render scale, the picture's width,
+ * height in the window, the window's width, height (0s before the first frame)}. */
+EXPORT JNIEXPORT jintArray JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_nativeGetVideoInfo(JNIEnv *env,
+                                                                                               jclass cls)
+{
+    int pace = 0;
+    float hz = 0.0f;
+    if (!hle_hitch_pace(&pace, &hz)) {
+        pace = 0;
+    }
+    NcPresentSizes s;
+    nc_present_sizes(&s);
+    jint v[9] = {(jint)pace, (jint)(hz * 100.0f + 0.5f), (jint)s.game_w, (jint)s.game_h,
+                 (jint)s.scale, (jint)s.out_w, (jint)s.out_h, (jint)s.win_w, (jint)s.win_h};
+    jintArray a = (*env)->NewIntArray(env, 9);
+    if (a) {
+        (*env)->SetIntArrayRegion(env, a, 0, 9, v);
+    }
+    return a;
 }
 
 /* The window's overlays and the game's GPU work (NativeCoreActivity's
@@ -418,16 +624,42 @@ static void *core_thread(void *arg)
 {
     if (!nc_core_boot(&g_core, g_disc_fd)) {
         nc_log("hakuX-app", "core: boot failed");
+        SDL_SetAtomicInt(&g_core_state, -1);
         if (!nc_hle_fatal()) {
             nc_hle_set_fatal(NC_FATAL_BOOT, "The game stopped while starting.");
         }
-        SDL_SetAtomicInt(&g_core_state, -1);
         return NULL;
     }
     SDL_SetAtomicInt(&g_core_state, 1);
     nc_core_run(&g_core);
     nc_log("hakuX-app", "core: stopped");
+    /* The guest stopped on its own (a crash, a bugcheck), not to leave or to
+     * relaunch: the activity says why and goes back to the library, instead
+     * of the last frame left on screen. Mark the core stopped first so the
+     * crash report sees g_core_state == -1 once the fatal dialog opens. */
+    const NcKernel *k = &g_core.kernel;
     SDL_SetAtomicInt(&g_core_state, -1);
+    if (k->need_dashboard && !nc_hle_fatal()) {
+        nc_hle_set_fatal(NC_FATAL_DASHBOARD,
+                         "An Xbox dashboard is not installed. Install an Xbox dashboard in HakuXP to use this "
+                         "feature.");
+    } else if (nc_kernel_missing_xbe() && !nc_hle_fatal()) {
+        nc_hle_set_fatal(NC_FATAL_MISSING_XBE, nc_kernel_missing_xbe());
+    } else if (!k->quit && !k->relaunch && !nc_hle_fatal()) {
+        /* the reason as a sentence: the dialog's title already says "The game stopped" */
+        char why[384];
+        if (g_core.disc.truncated) {
+            snprintf(why, sizeof(why),
+                     "This ISO image is incomplete or damaged.\n"
+                     "Delete this ISO and copy the full ISO again.\n"
+                     "(%s)",
+                     k->stop ? k->stop_reason : "The title halted the CPU");
+        } else {
+            snprintf(why, sizeof(why), "%s.", k->stop ? k->stop_reason : "The title halted the CPU");
+            why[0] = (char)toupper((unsigned char)why[0]);
+        }
+        nc_hle_set_fatal(NC_FATAL_STOPPED, why);
+    }
     return NULL;
 }
 
@@ -436,8 +668,9 @@ static int16_t clamp16(int v)
     return (int16_t)(v > 32767 ? 32767 : v < -32767 ? -32767 : v);
 }
 
-/* The Duke from a modern gamepad: face buttons and black/white (the shoulder
- * buttons) are analog on the Xbox, fully pressed here; stick Y points up. */
+/* The Duke from a modern gamepad (the legacy SDL input): face buttons and
+ * black/white (the shoulder buttons) are analog on the Xbox, fully pressed
+ * here; stick Y points up. */
 static void read_gamepad(SDL_Gamepad *p, NcPadState *s)
 {
     static const SDL_GamepadButton k_analog[6] = {
@@ -496,10 +729,14 @@ static void make_hdd(const char *root)
 
 EXPORT int SDL_main(int argc, char *argv[])
 {
+    /* The app-wide :debug service owns XBDM, including failures before SDL
+     * starts. Android logging reaches it from every app process. xboxrun
+     * retains its standalone monitor. */
     if (argc < 3) {
         nc_log("hakuX-app", "usage: <disc path | fd:N> <hdd folder>");
         return 1;
     }
+    nc_device_log();    /* what this run is on, before the GPU driver's own line */
     const char *disc = argv[1];
     /* "none": no disc (the dashboard, option dash) */
     g_disc_fd = !strcmp(disc, "none")       ? -1
@@ -557,6 +794,9 @@ EXPORT int SDL_main(int argc, char *argv[])
         if (nc_option(&opt, argv[i])) {
             continue;                           /* the core's (native/core/options.h) */
         }
+        if (nc_app_playbook_arg(argv[i])) {
+            continue;                           /* playbook=, record=, playrun= (playbook_jni.c) */
+        }
         if (!strcmp(argv[i], "padinput=sdl")) {
             g_sdl_pads = true;
         }
@@ -571,6 +811,9 @@ EXPORT int SDL_main(int argc, char *argv[])
         if (!strncmp(argv[i], "fxaa=", 5)) {
             nc_present_set_fxaa(atoi(argv[i] + 5) != 0);
         }
+        if (!strncmp(argv[i], "stamp=", 6)) {
+            nc_present_set_stamp(atoi(argv[i] + 6) != 0);
+        }
         if (!strncmp(argv[i], "upscale=", 8)) {
             nc_present_set_upscale(!strcmp(argv[i] + 8, "sgsr") ? NC_UPSCALE_SGSR : NC_UPSCALE_BILINEAR);
         }
@@ -581,6 +824,7 @@ EXPORT int SDL_main(int argc, char *argv[])
         }
     }
     nc_options_apply(&opt);
+    nc_app_playbook_begin();
     nc_present_set_widescreen(opt.video >= 0 && (opt.video & NC_VIDEO_WIDESCREEN));
     nc_log("hakuX-app", "native core: disc %s, hdd %s%s", disc, argv[2], opt.uncap ? ", frame rate uncapped" : "");
 

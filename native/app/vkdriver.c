@@ -116,6 +116,10 @@ void nc_vk_driver_load(const char *spec)
             g_kgsl_prio = prio;
             nc_log("hakuX-app", "its kgsl draw contexts at priority %d (ringbuffer %d of 0-3)", prio, prio / 4);
         }
+    } else {
+        /* a plain library path was taken silently before: every headless run
+         * of 2026-11-15 and the first sweep ran on the system driver */
+        nc_log("hakuX-app", "vkdriver=%s: not DIR|LIB|HOOKS, the system driver it is", spec);
     }
 #else
     nc_log("hakuX-app", "Vulkan driver requested, but this build has no adrenotools");

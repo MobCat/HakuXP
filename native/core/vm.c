@@ -320,6 +320,21 @@ bool nc_vm_unmap(NcVm *vm, uint32_t va, uint32_t len)
     return true;
 }
 
+bool nc_vm_map_zero_ro(NcVm *vm, uint32_t va, uint32_t len)
+{
+    if (!len || ((va | len) & (NC_PAGE - 1)) || (uint64_t)va + len > (1ull << 32)) {
+        nc_log("hakuX-native", "vm: bad zero_ro map va=%08x len=%x", va, len);
+        return false;
+    }
+    void *want = vm->base + va;
+    void *m = mmap(want, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (m != want) {
+        nc_log("hakuX-native", "vm: zero_ro map va=%08x len=%x failed: %s", va, len, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 /* A page an address still maps, handed out again: its owner and the new one
  * both write it (the new one zeroes it, mostly). Logged, the first 16, with
  * the caller as an offset in this library (llvm-addr2line). */

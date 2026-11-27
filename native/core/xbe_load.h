@@ -25,6 +25,7 @@ typedef struct NcXbe {
     uint32_t tls_dir;      /* VA of the IMAGE_TLS_DIRECTORY, or 0 */
     uint32_t stack_commit; /* PE stack commit size from the header */
     unsigned thunks;       /* kernel imports resolved */
+    char name[64];         /* basename of the loaded XBE ("default.xbe", "xonlinedash.xbe") */
 } NcXbe;
 
 /* path: on the disc ("\default.xbe", or "\Device\CdRom0\..."), or on a hard

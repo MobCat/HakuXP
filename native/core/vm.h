@@ -115,6 +115,11 @@ extern NcVmDma nc_vm_dma;
 /* Back guest VA [va, va+len) with nothing again (accesses fault). */
 bool nc_vm_unmap(NcVm *vm, uint32_t va, uint32_t len);
 
+/* Map guest VA [va, va+len) as host-backed read-only zero pages without
+ * consuming guest RAM or setting vm->pte. Reads return 0; writes still
+ * fault into the guest. nc_vm_unmap restores PROT_NONE. */
+bool nc_vm_map_zero_ro(NcVm *vm, uint32_t va, uint32_t len);
+
 /* Physical address behind a guest VA, or UINT32_MAX if unmapped. */
 static inline uint32_t nc_vm_phys(const NcVm *vm, uint32_t va)
 {

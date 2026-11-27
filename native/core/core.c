@@ -236,9 +236,25 @@ bool nc_core_boot(NcCore *c, int disc_fd)
                              "feature.");
             return false;
         }
-        const char *name = strrchr(xbe_path, '\\');
+        static const char cd[] = "\\Device\\CdRom0\\";
+        NcDiscFile df;
+        bool missing;
+        if (!strncasecmp(xbe_path, cd, sizeof(cd) - 1)) {
+            missing = disc_fd >= 0 && !nc_disc_find(&c->disc, xbe_path + sizeof(cd) - 2, &df);
+        } else if (xbe_path[0] == '\\' && strncasecmp(xbe_path, "\\Device\\", 8) != 0) {
+            missing = disc_fd >= 0 && !nc_disc_find(&c->disc, xbe_path, &df);
+        } else {
+            missing = !nc_io_host_file(xbe_path, host, sizeof(host));
+        }
+        const char *slash = strrchr(xbe_path, '\\');
+        const char *name = slash ? slash + 1 : xbe_path;
+        const char *short_name = name[0] ? name : xbe_path;
+        if (missing) {
+            nc_hle_set_fatal(NC_FATAL_MISSING_XBE, short_name);
+            return false;
+        }
         snprintf(why, sizeof(why), "The game's program (%s) can't be loaded: it's damaged, or hakuX doesn't support "
-                 "it yet.", name ? name + 1 : xbe_path);
+                 "it yet.", short_name);
         return boot_failed(why);
     }
     nc_kernel_title_loaded(&c->kernel, &c->disc, &c->xbe.file, c->xbe.fd, c->xbe.info.base,

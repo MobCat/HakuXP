@@ -28,7 +28,7 @@ bool nc_option(NcOptions *o, const char *arg)
 {
     const char *v;
     if (nc_net_option(arg)) {
-        /* net=, dns=, lanport=, lanbcast=, lanpeers=, kai= (native/net/net.h) */
+        /* net=, dns=, ip=, mask=, gw=, hostname=, lanport=, lanbcast=, lanpeers=, kai= (native/net/net.h) */
     } else if (!strcmp(arg, "uncap")) {
         o->uncap = true;
     } else if (!strcmp(arg, "relaunch")) {
