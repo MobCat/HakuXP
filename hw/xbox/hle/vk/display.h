@@ -60,6 +60,10 @@ uint32_t hle_disp_gamma_seq(void);
 /* The front frame's generation and swap id, without taking it (the
  * presenter's look for a new frame); false: none. */
 bool hle_disp_front(uint32_t *gen, uint32_t *swap_id);
+/* Sleep up to timeout_ms while the front frame and gamma ramp still match
+ * (have, gen, swap_id, gamma_seq); wakes at once on a new frame or gamma.
+ * False if the display mutex/condition is not initialized yet. */
+bool hle_disp_wait_change(bool have, uint32_t gen, uint32_t swap_id, uint32_t gamma_seq, int timeout_ms);
 /* Called on the presenter's thread with each frame it picks up the first
  * time: its swap id and the time (CLOCK_MONOTONIC, us). For input timings
  * (native/dev/xid.c); NULL removes it. */

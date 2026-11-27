@@ -142,6 +142,8 @@ typedef struct PbObj {
     bool want;                          /* ... drawn into since its last landing */
     uint8_t unread;                     /* its landings in a row the guest didn't take */
     bool display;                       /* shown: the front-buffer path keeps its memory */
+    uint64_t rb_written;                /* written as of its image's last readback for a copy
+                                           that read it (copy_src_land; old paths' targets) */
 } PbObj;
 
 /* A texture the stage registers described: the back end's image of it,
@@ -747,8 +749,32 @@ static PbObj *new_slot(uint32_t keep_pa, uint32_t keep_len)
  * part of the identity: it comes from the pitch or the display (linear_size),
  * and DOA2's supersampled 1440-wide fight buffer in the same 1536-pixel
  * pitch, shown as the wider one, had 96 never drawn columns. */
+/* A linear surface's rows as far as the memory behind it reaches: the
+ * guest's contiguous block holding it (hle_host_mem_block_end), when the
+ * host knows one. The height comes from the clip or the display, which can
+ * be taller than the buffer: Ford Racing 2 binds its 640 x 480 frame (a
+ * 1200 KiB block) while the display is still the guess its 640 x 960 back
+ * buffer made (linear_size), and the object, 960 rows, marked and restored
+ * the 1200 KiB past the block. The XBE's TLS index there went to 0, and
+ * XAPI's SetLastError wrote through it at the intro's movie. */
+static uint32_t block_rows(uint32_t pa, uint32_t pitch, uint32_t h)
+{
+    const uint32_t end = pitch ? hle_host_mem_block_end(pa) : 0;
+    const uint32_t rows = end > pa ? (end - pa) / pitch : 0;
+    if (!rows || rows >= h) {
+        return h;
+    }
+    static unsigned s_logged;
+    if (s_logged++ < 8) {
+        hle_log("hakuX-hle-pb", "surface %08x: %u rows (pitch %u) cut to the %u its memory holds (to %08x)", pa,
+                h, pitch, rows, end);
+    }
+    return rows;
+}
+
 static uint32_t object(uint32_t pa, uint32_t xfmt, uint32_t pitch, uint32_t w, uint32_t h)
 {
+    h = block_rows(pa, pitch, h);
     uint32_t best = 0;
     uint64_t best_area = 0;
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
@@ -820,6 +846,7 @@ static uint32_t object(uint32_t pa, uint32_t xfmt, uint32_t pitch, uint32_t w, u
 static uint32_t object_view(uint32_t pa, uint32_t xfmt, uint32_t alt, uint32_t pitch, uint32_t w,
                             uint32_t h)
 {
+    h = block_rows(pa, pitch, h);
     for (unsigned i = 0; alt && i < g_pd.nobjs; i++) {
         const HleSurfDesc *d = &g_pd.objs[i].d;
         if (d->pa == pa && d->xfmt == alt && d->w == w && d->h == h) {
@@ -999,22 +1026,28 @@ static bool rt_cpu_sync(uint32_t id)
 static struct {
     uint32_t pa, len;
     uint64_t v;
+    bool inval;                         /* the GPU wrote it in place, and the CPU reads it
+                                           next (copy_src_land): no stale cache line */
 } g_wbn[WB_NOTES];
 static uint32_t g_wbn_next;
 
 static void wb_landed(uint32_t token, bool landed)
 {
     if (landed) {
+        if (g_wbn[token % WB_NOTES].inval) {
+            hle_mem_cache_inval(g_wbn[token % WB_NOTES].pa, g_wbn[token % WB_NOTES].len);
+        }
         hle_mem_host_wrote(g_wbn[token % WB_NOTES].pa, g_wbn[token % WB_NOTES].len);
     }
 }
 
-static void wb_note(uint32_t pa, uint32_t len, uint64_t v)
+static void wb_note(uint32_t pa, uint32_t len, uint64_t v, bool inval)
 {
     const uint32_t k = g_wbn_next++ % WB_NOTES;
     g_wbn[k].pa = pa;
     g_wbn[k].len = len;
     g_wbn[k].v = v;
+    g_wbn[k].inval = inval;
     hle_tl_land_note(v, wb_landed, k);
 }
 
@@ -1061,7 +1094,7 @@ static void writeback(uint32_t id)
     hle_res_rb_land(rb, fb, len, hle_fe_last_value() + 1);     /* the next submission */
     hle_barrier_arm_landing(d->pa, len, hle_fe_last_value() + 1);
     hle_fe_commit();
-    wb_note(d->pa, len, hle_fe_last_value() + 1);
+    wb_note(d->pa, len, hle_fe_last_value() + 1, false);
     g_pd.writebacks++;
 }
 
@@ -2324,7 +2357,29 @@ static const HleSurfDesc *object_desc(uint32_t id)
  * does that: Morrowind copies its inventory's character out of its target
  * (cleared red) and back, keying the red out on the CPU in between; as image
  * copies, the character came back on red, a black band over its head (the
- * copy's 4096 x 64 rows into the 256 x 256 target). */
+ * copy's 4096 x 64 rows into the 256 x 256 target).
+ *
+ * A swizzled target whose memory the blit's rows cover whole is memory with
+ * none: what is there after it is the copy (blit_covers_swz). The copy goes
+ * into a linear object there, which counts as bound now (the memory's latest
+ * writer, what a texture over it samples until the target is bound again).
+ * The Punisher's slaughter mode blits its back buffer each frame over the
+ * memory of a 256 x 256 R5G6B5 target it drew earlier in the frame, and
+ * samples that memory as a 640 x 480 LIN_A8R8G8B8 texture; copied through
+ * memory, the decoder waited for the frame's readback each frame (16-19 fps
+ * where the effect starts, from 20-25). */
+static bool blit_covers_swz(const PbObj *dd, uint32_t dbase, uint32_t dp, uint32_t bpp, uint32_t ox,
+                            uint32_t oy, uint32_t w, uint32_t h)
+{
+    const HleFmtInfo *fi = dd && !dd->d.pitch && !dd->cube && !dd->d.parent ? hle_fmt_info(dd->d.xfmt) : NULL;
+    if (!fi || fi->bpp < 8 || ox || (uint64_t)w * bpp != dp) {
+        return false;
+    }
+    const uint64_t len = (uint64_t)dd->d.w * dd->d.h * (fi->bpp / 8);
+    const uint64_t lo = (uint64_t)dbase + (uint64_t)oy * dp, hi = lo + (uint64_t)dp * h;
+    return len && lo <= dd->d.pa && hi >= dd->d.pa + len;
+}
+
 bool hle_pbd_blit_images(uint32_t sbase, uint32_t sp, uint32_t dbase, uint32_t dp, uint32_t bpp,
                          uint32_t ix, uint32_t iy, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h)
 {
@@ -2337,10 +2392,14 @@ bool hle_pbd_blit_images(uint32_t sbase, uint32_t sp, uint32_t dbase, uint32_t d
         hle_log("hakuX-hle-pb", "blit %08x/%u -> %08x/%u bpp %u %ux%u from %u,%u to %u,%u objects %u -> %u",
                 sbase, sp, dbase, dp, bpp, w, h, ix, iy, ox, oy, src, dst);
     }
-    if (so && so->d.pitch && !dd && dp) {
+    const bool over_swz = so && so->d.pitch && dp && blit_covers_swz(dd, dbase, dp, bpp, ox, oy, w, h);
+    if (so && so->d.pitch && (!dd || over_swz) && dp) {
         dst = object(dbase, so->d.xfmt, dp, MAX(dp / bpp, ox + w), oy + h);
         so = obj_of(src);                   /* (a slot may have gone to it) */
         dd = obj_of(dst);
+        if (over_swz && dd) {
+            dd->bound = ++g_pd.binds;
+        }
     }
     if (!so || !so->d.pitch || !dd || !dd->d.pitch || dst == src) {
         rt_cpu_sync(src);
@@ -3173,7 +3232,7 @@ static unsigned writeback_range(uint32_t pa, uint32_t end, bool gpu_newer, const
         hle_res_rb_land(rb, fb, len, v);
         hle_barrier_arm_landing(next->d.pa, len, v);
         hle_fe_commit();
-        wb_note(next->d.pa, len, v);
+        wb_note(next->d.pa, len, v, false);
         *lv = MAX(*lv, v);
         if (!gpu_newer) {
             hle_log("hakuX-hle-pb", "%s %08x+%u: surface %u (%08x %ux%u) written back", what, pa, end - pa,
@@ -4589,6 +4648,62 @@ static bool copy_covers(const PbObj *o, uint32_t len, uint32_t dlo, uint32_t dp,
     return c + o->d.w * (fi->bpp / 8) <= row && q + o->d.h <= rows;
 }
 
+/* A copy's source [s0, s1) over a linear colour target the coherence doesn't
+ * keep (a frame buffer, whose memory the front buffer's path fills only at
+ * the guest's first write; a small target or one the CPU uses, written back
+ * at their unbind) drawn into since a copy last read it: its image read back
+ * into its memory first (the CPU's writes there taken into the image
+ * before), the copy queued behind it. The value the readbacks land at; 0:
+ * none. The 2D engine reads the frame the NV2A just drew: The Punisher's
+ * slaughter mode blits its back buffer into a texture's memory each frame
+ * and draws the frame again from it, desaturated, without blending; copied
+ * from memory that held the frame shown two swaps before, the scene never
+ * showed, only a gray zoom of the effect's own last frames. (That blit is
+ * an image copy now, hle_pbd_blit_images; this serves the copies that
+ * aren't, at a wait for the GPU each.) */
+static uint64_t copy_src_land(uint32_t s0, uint32_t s1)
+{
+    uint64_t v = 0;
+    for (unsigned i = 0; g_pd.device && i < g_pd.nobjs; i++) {
+        PbObj *o = &g_pd.objs[i];
+        const HleFmtInfo *fi = !o->cube && !o->d.parent && o->d.pitch ? hle_fmt_info(o->d.xfmt) : NULL;
+        const uint32_t len = fi ? o->d.pitch * o->d.h : 0;
+        uint32_t kl;
+        if (!fi || (fi->flags & (HLE_FI_DEPTH | HLE_FI_DXT)) || !len || o->d.pa >= s1 ||
+            o->d.pa + len <= s0 || coh_managed(o, &kl)) {
+            continue;
+        }
+        rt_cpu_upload(o->id, false);
+        if (!o->written || o->written <= o->rb_written || obj_superseded(o)) {
+            continue;
+        }
+        const uint32_t fb = hle_res_rb_fb(len);
+        if (!fb) {
+            coh_pend_wait_inplace(o->d.pa, len);
+        }
+        HleCmdReadback *rb = begin(HLE_OP_READBACK, sizeof(*rb));
+        memset(rb, 0, sizeof(*rb));
+        const uint64_t lv = hle_fe_last_value() + 1;   /* the submission it goes with */
+        rb->surf = o->id;
+        rb->pa = o->d.pa;
+        rb->pitch = o->d.pitch;
+        rb->arena_off = HLE_RB_DIRECT;
+        hle_res_rb_land(rb, fb, len, lv);
+        const bool inplace = !rb->fb;           /* (the command is the back end's once committed) */
+        hle_barrier_arm_landing(o->d.pa, len, lv);
+        hle_fe_commit();
+        wb_note(o->d.pa, len, lv, inplace);
+        o->rb_written = o->written;
+        g_pd.writebacks++;
+        v = MAX(v, lv);
+        if (rtlog_on()) {
+            hle_log("hakuX-hle-pb", "copy from %08x+%u: surface %u (%08x %ux%u) read back first", s0, s1 - s0,
+                    o->id, o->d.pa, o->d.w, o->d.h);
+        }
+    }
+    return v;
+}
+
 /* The targets the coherence keeps whose images are newer than their memory
  * land first: over the source; over the destination, where the copy leaves
  * some of their bytes. A blit's linear destination target (at dbase) doesn't
@@ -4616,6 +4731,7 @@ uint64_t hle_pbd_copy_begin(uint32_t slo, uint32_t sp, uint32_t dlo, uint32_t dp
     }
     const uint64_t done = hle_tl_completed();
     uint64_t v = MAX(coh_pend_any(s0, s1, false), coh_pend_any(d0, d1, true));
+    v = MAX(v, copy_src_land(s0, s1));
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         const PbObj *o = &g_pd.objs[i];
         if (o->land_last > done && coh_len(o, &len) &&

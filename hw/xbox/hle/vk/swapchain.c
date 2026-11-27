@@ -673,6 +673,14 @@ bool hle_present_unchanged(struct ANativeWindow *win, uint64_t key)
     return !front || (gen == g_ps.f.gen && swap_id == g_ps.f.swap_id);
 }
 
+bool hle_present_wait_unchanged(struct ANativeWindow *win, uint64_t key, int timeout_ms)
+{
+    if (!hle_present_unchanged(win, key)) {
+        return true;
+    }
+    return hle_disp_wait_change(g_ps.have, g_ps.f.gen, g_ps.f.swap_id, g_ps.ramp_gen, timeout_ms);
+}
+
 bool hle_present_begin(struct ANativeWindow *win, uint32_t *w, uint32_t *h)
 {
     if (g_ps.failed || !hle_vk_ready() || hle_vk_lost()) {

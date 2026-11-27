@@ -128,6 +128,7 @@ int hle_disp_init(uint32_t w, uint32_t h)
         }
         hle_log("hakuX-hle-back", "display disabled: slot creation failed");
     }
+    hle_cond_broadcast(&g_disp.cond);
     hle_mutex_unlock(&g_disp.lock);
     hle_mutex_unlock(&g_disp.use);
     hle_log("hakuX-hle-back", "display %ux%u gen %u (%d slots)", w, h, g_disp.gen, HLE_DISP_SLOTS);
@@ -177,6 +178,7 @@ static void to_front(int i, uint32_t swap_id)
     g_disp.s[i].state = SLOT_FRONT;
     g_disp.st.presented++;
     hle_hitch_frame(swap_id, HLE_FR_FRONT);
+    hle_cond_broadcast(&g_disp.cond);
 }
 
 int hle_disp_begin_write(uint32_t swap_id, uint64_t value)
@@ -290,10 +292,12 @@ bool hle_disp_present(uint32_t swap_id)
             break;
         }
     }
-    if (!found && g_disp.present_late && swap_id > g_disp.want) {
-        g_disp.want = swap_id;            /* applies when the frame is written */
+    if (!found) {
+        if (g_disp.present_late && swap_id > g_disp.want) {
+            g_disp.want = swap_id;            /* applies when the frame is written */
+        }
+        hle_cond_broadcast(&g_disp.cond);
     }
-    hle_cond_broadcast(&g_disp.cond);
     hle_mutex_unlock(&g_disp.lock);
     return found;
 }
@@ -464,6 +468,11 @@ void hle_disp_set_gamma(const uint8_t rgb[3][256], bool identity)
     g_gamma.identity = identity;
     hle_smp_wmb();
     hle_atomic_set(&g_gamma.seq, g_gamma.seq + 1);
+    if (hle_atomic_load_acquire(&g_disp.inited)) {
+        hle_mutex_lock(&g_disp.lock);
+        hle_cond_broadcast(&g_disp.cond);
+        hle_mutex_unlock(&g_disp.lock);
+    }
 }
 
 uint32_t hle_disp_gamma_seq(void)
@@ -471,23 +480,56 @@ uint32_t hle_disp_gamma_seq(void)
     return hle_atomic_load_acquire(&g_gamma.seq);
 }
 
-bool hle_disp_front(uint32_t *gen, uint32_t *swap_id)
+static bool front_locked(uint32_t *gen, uint32_t *swap_id)
 {
-    bool found = false;
-    if (!hle_atomic_load_acquire(&g_disp.inited)) {
-        return false;
-    }
-    hle_mutex_lock(&g_disp.lock);
-    for (int i = 0; i < HLE_DISP_SLOTS && !found; i++) {
+    for (int i = 0; i < HLE_DISP_SLOTS; i++) {
         const HleDispSlot *s = &g_disp.s[i];
         if (s->state == SLOT_FRONT && s->img) {
             *gen = g_disp.gen;
             *swap_id = s->swap_id;
-            found = true;
+            return true;
         }
     }
+    return false;
+}
+
+static bool front_matches(bool have, uint32_t gen, uint32_t swap_id, uint32_t gamma_seq)
+{
+    if (hle_disp_gamma_seq() != gamma_seq) {
+        return false;
+    }
+    uint32_t cg = 0, cs = 0;
+    const bool front = front_locked(&cg, &cs);
+    return front == have && (!front || (cg == gen && cs == swap_id));
+}
+
+bool hle_disp_front(uint32_t *gen, uint32_t *swap_id)
+{
+    if (!hle_atomic_load_acquire(&g_disp.inited)) {
+        return false;
+    }
+    hle_mutex_lock(&g_disp.lock);
+    const bool found = front_locked(gen, swap_id);
     hle_mutex_unlock(&g_disp.lock);
     return found;
+}
+
+bool hle_disp_wait_change(bool have, uint32_t gen, uint32_t swap_id, uint32_t gamma_seq, int timeout_ms)
+{
+    if (!hle_atomic_load_acquire(&g_disp.inited)) {
+        return false;
+    }
+    const int64_t end = g_get_monotonic_time() + (int64_t)timeout_ms * 1000;
+    hle_mutex_lock(&g_disp.lock);
+    while (front_matches(have, gen, swap_id, gamma_seq)) {
+        const int64_t rem = (end - g_get_monotonic_time() + 999) / 1000;
+        if (rem <= 0) {
+            break;
+        }
+        hle_cond_timedwait(&g_disp.cond, &g_disp.lock, (int)rem);
+    }
+    hle_mutex_unlock(&g_disp.lock);
+    return true;
 }
 
 bool hle_disp_gamma(uint8_t rgb[3][256], bool *identity, uint32_t *gen)
