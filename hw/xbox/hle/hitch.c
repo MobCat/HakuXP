@@ -52,6 +52,13 @@ typedef struct Last {
     char reason[96];
 } Last;
 
+typedef struct LastDrop {
+    bool valid;
+    unsigned no;            /* the stutter #N log line that dropped these frames */
+    unsigned count;         /* frames dropped in that event */
+    int64_t start_us;
+} LastDrop;
+
 /* A frame's timeline (monotonic us), by swap id. */
 #define FR_RING 256
 typedef struct FrameT {
@@ -86,6 +93,7 @@ static struct {
     /* status */
     unsigned stutters, hangs;
     Last last_hang, last_stutter;
+    LastDrop last_dropped;
     /* windows closed by the decoder (hle_hitch_pb_swap) */
     uint64_t swaps;
     float swap_ms;                      /* the guest's recent frame time (average) */
@@ -775,9 +783,6 @@ static void display_eval(uint32_t id, const FrameT *f)
     if (!late && !skipped) {
         return;
     }
-    if (skipped) {
-        g_h.dropped += skipped;
-    }
 #define T(st) (f->t[st] ? (f->t[st] - pfront) / 1000.0 : 0.0)
     double ts = T(HLE_FR_SWAP), tw = T(HLE_FR_WRITE), tr = T(HLE_FR_READY);
     double tf = T(HLE_FR_FRONT), tu = T(HLE_FR_SHOWN), tl = T(HLE_FR_FLIP);
@@ -866,6 +871,13 @@ static void display_eval(uint32_t id, const FrameT *f)
     l->start_us = pfront;
     l->ms = fint;
     hle_strlcpy(l->reason, sizeof(l->reason), reason);
+    if (skipped) {
+        g_h.dropped += skipped;
+        g_h.last_dropped.valid = true;
+        g_h.last_dropped.no = no;
+        g_h.last_dropped.count = skipped;
+        g_h.last_dropped.start_us = pfront;
+    }
     hle_mutex_unlock(&g_h.mx);
     char fl[24] = "";
     if (hl) {
@@ -944,6 +956,11 @@ bool hle_hitch_overlay(char *buf, size_t n)
         ago(a, sizeof(a), now - g_h.last_stutter.start_us);
         o += snprintf(buf + o, n - o, "\nlast stutter #%u: %.0f ms, %s", g_h.last_stutter.no,
                       g_h.last_stutter.ms, a);
+    }
+    if (g_h.last_dropped.valid && o < n) {
+        ago(a, sizeof(a), now - g_h.last_dropped.start_us);
+        o += snprintf(buf + o, n - o, "\nlast dropped: %u frame%s (#%u), %s", g_h.last_dropped.count,
+                      g_h.last_dropped.count == 1 ? "" : "s", g_h.last_dropped.no, a);
     }
     hle_mutex_unlock(&g_h.mx);
     return true;

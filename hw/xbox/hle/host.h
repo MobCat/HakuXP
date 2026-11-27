@@ -62,6 +62,11 @@ int hle_va_rw(uint32_t va, void *buf, size_t len, bool write);
 /* Host stores by guest VA are guest writes for write tracking: call before
  * writing [va, va + len). */
 void hle_va_store(uint32_t va, uint32_t len);
+/* The end (the first byte past it) of the guest's contiguous allocation
+ * holding physical address pa, as the kernel handed it out; 0 if pa is in
+ * none the host knows. Any thread. A surface's memory ends there: past it
+ * is someone else's. */
+uint32_t hle_host_mem_block_end(uint32_t pa);
 
 /* ---- write tracking of guest RAM (physical addresses) -------------------- */
 
